@@ -5,15 +5,14 @@ mod inode;
 
 #[cfg(feature = "mount")]
 mod app {
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     use clap::Parser;
 
     use crate::fs::MqFs;
 
-    /// FUSE-mount one or more Markdown files as a virtual filesystem: each file
+    /// NFS-mount one or more Markdown files as a virtual filesystem: each file
     /// gets a top-level directory named after it, headings become
     /// subdirectories, and each section's body becomes a `content.md` file.
     #[derive(Parser, Debug)]
@@ -26,29 +25,14 @@ mod app {
         /// Mount read-only; all writes are rejected
         #[arg(long)]
         readonly: bool,
-        /// Allow other users on the machine to access the mount
+        /// Loosen file permission bits so other local users can read/write
+        /// the mount (the underlying NFS server has no per-caller ACL to
+        /// restrict access to the mounting user)
         #[arg(long)]
         allow_other: bool,
         /// Enable verbose (debug) logging
         #[arg(short, long)]
         verbose: bool,
-    }
-
-    static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-
-    extern "C" fn on_sigint(_signum: libc::c_int) {
-        INTERRUPTED.store(true, Ordering::SeqCst);
-    }
-
-    fn wait_for_sigint() {
-        // Safety: `on_sigint` only touches a static AtomicBool, which is
-        // async-signal-safe; no allocation or locking happens in it.
-        unsafe {
-            libc::signal(libc::SIGINT, on_sigint as libc::sighandler_t);
-        }
-        while !INTERRUPTED.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(200));
-        }
     }
 
     pub fn run() -> miette::Result<()> {
@@ -79,39 +63,83 @@ mod app {
             .iter()
             .map(|f| f.canonicalize().map_err(|e| miette::miette!("failed to resolve {}: {e}", f.display())))
             .collect::<miette::Result<Vec<_>>>()?;
-        let filesystem = MqFs::new(source_paths.clone(), cli.readonly)
+        let filesystem = MqFs::new(source_paths.clone(), cli.readonly, cli.allow_other)
             .map_err(|e| miette::miette!("failed to read source file(s): {e}"))?;
 
-        let mut mount_options = vec![
-            fuser::MountOption::FSName("mq-mount".to_string()),
-            fuser::MountOption::Subtype("mqmount".to_string()),
-        ];
-        if cli.readonly {
-            mount_options.push(fuser::MountOption::RO);
-        }
-        let acl = if cli.allow_other {
-            fuser::SessionACL::All
-        } else {
-            fuser::SessionACL::Owner
-        };
-        // `Config` is `#[non_exhaustive]`, so it can't be built with struct-literal
-        // syntax from outside `fuser` even via `..Default::default()` — mutate a
-        // `Default`-constructed value instead.
-        let mut config = fuser::Config::default();
-        config.mount_options = mount_options;
-        config.acl = acl;
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| miette::miette!("failed to start async runtime: {e}"))?
+            .block_on(run_mounted(filesystem, mountpoint, source_paths.len(), cli.readonly))
+    }
 
-        let session = fuser::spawn_mount(filesystem, mountpoint, &config)
-            .map_err(|e| miette::miette!("failed to mount: {e}"))?;
-        tracing::info!("mounted {} file(s) at {}", source_paths.len(), mountpoint.display());
+    async fn run_mounted(filesystem: MqFs, mountpoint: &Path, file_count: usize, readonly: bool) -> miette::Result<()> {
+        use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 
-        wait_for_sigint();
+        let mut listener = NFSTcpListener::bind("127.0.0.1:0", filesystem)
+            .await
+            .map_err(|e| miette::miette!("failed to start NFS server: {e}"))?;
+        listener.with_export_name("mq-mount");
+        let port = listener.get_listen_port();
+        let server = tokio::spawn(async move {
+            let _ = listener.handle_forever().await;
+        });
+
+        mount_nfs(mountpoint, port, readonly)?;
+        tracing::info!("mounted {file_count} file(s) at {}", mountpoint.display());
+
+        tokio::signal::ctrl_c().await.ok();
 
         tracing::info!("unmounting");
-        session
-            .umount_and_join()
-            .map_err(|e| miette::miette!("failed to unmount cleanly: {e}"))?;
+        unmount(mountpoint)?;
+        server.abort();
         Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn mount_nfs(mountpoint: &Path, port: u16, readonly: bool) -> miette::Result<()> {
+        let mut opts = format!("noac,nolocks,vers=3,tcp,port={port},mountport={port}");
+        if readonly {
+            opts.push_str(",ro");
+        }
+        run_mount_command(Command::new("mount_nfs").args(["-o", &opts, "localhost:/mq-mount", &mountpoint.to_string_lossy()]))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn mount_nfs(mountpoint: &Path, port: u16, readonly: bool) -> miette::Result<()> {
+        let mut opts = format!("noac,nolock,vers=3,tcp,port={port},mountport={port}");
+        if readonly {
+            opts.push_str(",ro");
+        }
+        run_mount_command(Command::new("mount").args([
+            "-t",
+            "nfs",
+            "-o",
+            &opts,
+            "localhost:/mq-mount",
+            &mountpoint.to_string_lossy(),
+        ]))
+    }
+
+    fn run_mount_command(cmd: &mut Command) -> miette::Result<()> {
+        let status = cmd.status().map_err(|e| miette::miette!("failed to run mount command: {e}"))?;
+        if !status.success() {
+            miette::bail!("failed to mount: mount command exited with {status}");
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn unmount(mountpoint: &Path) -> miette::Result<()> {
+        // Plain `umount` requires root for a non-FUSE mount even when owned by
+        // the calling user; `diskutil unmount` goes through DiskArbitration and
+        // works unprivileged.
+        run_mount_command(Command::new("diskutil").args(["unmount", &mountpoint.to_string_lossy()]))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn unmount(mountpoint: &Path) -> miette::Result<()> {
+        run_mount_command(Command::new("umount").arg(mountpoint))
     }
 }
 
@@ -122,10 +150,6 @@ fn main() -> miette::Result<()> {
 
 #[cfg(not(feature = "mount"))]
 fn main() {
-    eprintln!(
-        "mq-mount was built without the `mount` feature: fuser needs libfuse (Linux) or \
-         macFUSE (macOS) present at build time. Install one of those and rebuild with \
-         `cargo build --features mount`."
-    );
+    eprintln!("mq-mount was built without the `mount` feature. Rebuild with `cargo build --features mount`.");
     std::process::exit(1);
 }

@@ -1,60 +1,30 @@
-//! `fuser::Filesystem` glue: translates FUSE calls into [`crate::document`]
-//! mutations. State lives behind a `Mutex` since almost every trait method
-//! takes `&self`.
+//! `NFSFileSystem` glue: translates NFSv3 calls into [`crate::document`]
+//! mutations. State lives behind a `Mutex` since every trait method takes
+//! `&self`.
 //!
 //! Each mounted file gets its own top-level directory (named after the file,
 //! deduplicated like sibling headings) under a synthetic super-root at
-//! `ROOT_INO`. The super-root itself is not backed by any document — it only
-//! ever lists one directory per mounted file, fixed at mount time — so it is
-//! deliberately kept out of `ino_owner` below: every handler's existing
-//! "resolve this ino to a document path, or bail" fallback then naturally
-//! rejects mkdir/rmdir/rename/create/unlink at or across that level without
-//! needing many explicit `ino == ROOT_INO` special cases.
+//! `ROOT_INO`. NFSv3 has no open/release; writes to `content.md` /
+//! frontmatter files are committed straight into the document on every
+//! `write()` call, and files created under a name we don't recognize (an
+//! editor's atomic-save temp file) are buffered in `scratch` until a
+//! `rename()` lands them on a canonical name.
 
-use std::ffi::OsStr;
 use std::fs;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use fuser::{
-    Errno, FileAttr, FileHandle as FuserFileHandle, FileType, Filesystem, Generation, INodeNo, RenameFlags, ReplyAttr,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request,
-};
+use async_trait::async_trait;
+use nfsserve::nfs::{fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, set_size3, specdata3};
+use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use rustc_hash::FxHashMap;
 
 use crate::document::{self, Document, FrontMatterKind, MutationError, Section};
 use crate::inode::{InodeTable, MountPath, ROOT_INO};
 
-const TTL: Duration = Duration::from_secs(1);
-
-enum Handle {
-    Dir,
-    Content {
-        file: usize,
-        path: Vec<String>,
-        buf: Vec<u8>,
-        dirty: bool,
-    },
-    FrontMatter {
-        file: usize,
-        kind: FrontMatterKind,
-        buf: Vec<u8>,
-        dirty: bool,
-    },
-    /// A file created under a name we don't recognize — most likely an
-    /// editor's temp file staged for an atomic-save rename onto a canonical
-    /// name. Never listed, never persisted on its own.
-    Scratch {
-        buf: Vec<u8>,
-    },
-}
-
-/// One mounted Markdown file and everything derived from it.
 struct FileMount {
-    /// Top-level directory name (file stem, extension stripped, deduplicated
-    /// against other mounted files' stems).
     slug: String,
     document: Document,
     tree: document::SectionTree,
@@ -65,25 +35,23 @@ struct FileMount {
 
 struct MountState {
     files: Vec<FileMount>,
-    /// Slug -> that file's root directory inode, fixed at mount time (the set
-    /// of mounted files never changes for the life of the process).
     root_children: Vec<(String, u64)>,
-    /// Inode -> index into `files`. Deliberately never contains `ROOT_INO`.
     ino_owner: FxHashMap<u64, usize>,
-    /// Shared across every file's `InodeTable` so inode numbers stay globally
-    /// unique across the whole mount.
     next_ino: u64,
-    handles: FxHashMap<u64, Handle>,
-    open_by_name: FxHashMap<(u64, String), u64>,
-    pending_renames: FxHashMap<(u64, String), Vec<u8>>,
-    next_fh: u64,
+    /// Buffers for files created under a non-canonical name (editor temp
+    /// files), keyed by their allocated fileid. Consumed by `rename()` onto a
+    /// canonical name; otherwise leaked for the life of the mount, matching
+    /// how the equivalent FUSE handle-based buffers behaved.
+    scratch: FxHashMap<u64, Vec<u8>>,
+    scratch_by_name: FxHashMap<(u64, String), u64>,
     readonly: bool,
+    allow_other: bool,
     uid: u32,
     gid: u32,
 }
 
 impl MountState {
-    fn open(source_paths: Vec<PathBuf>, readonly: bool) -> std::io::Result<Self> {
+    fn open(source_paths: Vec<PathBuf>, readonly: bool, allow_other: bool) -> std::io::Result<Self> {
         let mut next_ino = ROOT_INO + 1;
         let mut seen_slugs: FxHashMap<String, u32> = FxHashMap::default();
         let mut files = Vec::with_capacity(source_paths.len());
@@ -120,18 +88,16 @@ impl MountState {
             }
         }
 
-        // Safety: getuid/getgid take no arguments and cannot fail.
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
         Ok(Self {
             files,
             root_children,
             ino_owner,
             next_ino,
-            handles: FxHashMap::default(),
-            open_by_name: FxHashMap::default(),
-            pending_renames: FxHashMap::default(),
-            next_fh: 1,
+            scratch: FxHashMap::default(),
+            scratch_by_name: FxHashMap::default(),
             readonly,
+            allow_other,
             uid,
             gid,
         })
@@ -166,14 +132,10 @@ impl MountState {
         Ok(())
     }
 
-    fn alloc_fh(&mut self) -> u64 {
-        let fh = self.next_fh;
-        self.next_fh += 1;
-        fh
-    }
-
-    fn ino_exists(&self, ino: u64) -> bool {
-        ino == ROOT_INO || self.ino_owner.contains_key(&ino)
+    fn alloc_ino(&mut self) -> u64 {
+        let ino = self.next_ino;
+        self.next_ino += 1;
+        ino
     }
 
     fn dir_path(&self, ino: u64) -> Option<(usize, Vec<String>)> {
@@ -195,15 +157,11 @@ impl MountState {
         self.files[file_idx].tree.find(&refs).cloned()
     }
 
-    /// Finds a named child section under `parent`, as used by `rmdir` and the
-    /// heading-rename branch of `rename` to resolve the entry being acted on.
     fn find_child_section(&self, file_idx: usize, parent: &[String], name: &str) -> Option<Section> {
         self.find_section(file_idx, parent)
             .and_then(|p| p.children.into_iter().find(|c| c.name == name))
     }
 
-    /// Like `find_section`, but for callers that only need the content range —
-    /// avoids deep-cloning the section's whole (possibly large) child subtree.
     fn section_range(&self, file_idx: usize, path: &[String]) -> Option<Range<usize>> {
         let refs: Vec<&str> = path.iter().map(String::as_str).collect();
         self.files[file_idx].tree.find(&refs).map(|s| s.own_content_range.clone())
@@ -215,11 +173,16 @@ impl MountState {
             .unwrap_or_default()
     }
 
-    /// Splices `text` into a section's content. If the section vanished
-    /// concurrently (deleted while a handle was open elsewhere), this is a
-    /// silent no-op rather than an error — matches how a local filesystem
-    /// treats writes to an unlinked-but-still-open file.
-    fn commit_content(&mut self, file_idx: usize, dir_path: &[String], text: &str) -> Result<(), Errno> {
+    fn frontmatter_bytes(&self, file_idx: usize, kind: FrontMatterKind) -> Vec<u8> {
+        self.files[file_idx]
+            .tree
+            .front_matter
+            .filter(|(k, _)| *k == kind)
+            .map(|(_, idx)| self.files[file_idx].document.frontmatter_value(idx).as_bytes().to_vec())
+            .unwrap_or_default()
+    }
+
+    fn commit_content(&mut self, file_idx: usize, dir_path: &[String], text: &str) -> Result<(), nfsstat3> {
         let Some(range) = self.section_range(file_idx, dir_path) else {
             return Ok(());
         };
@@ -228,70 +191,70 @@ impl MountState {
             .replace_section_content(range, text)
             .map_err(map_mutation_error)?;
         self.rebuild(file_idx);
-        self.persist(file_idx).map_err(|_| Errno::EIO)?;
+        self.persist(file_idx).map_err(|_| nfsstat3::NFS3ERR_IO)?;
         Ok(())
     }
 
-    fn commit_frontmatter(&mut self, file_idx: usize, kind: FrontMatterKind, text: &str) -> Result<(), Errno> {
+    fn commit_frontmatter(&mut self, file_idx: usize, kind: FrontMatterKind, text: &str) -> Result<(), nfsstat3> {
         if let Some((found_kind, idx)) = self.files[file_idx].tree.front_matter
             && found_kind == kind
         {
             self.files[file_idx].document.set_frontmatter(idx, text.to_string());
             self.rebuild(file_idx);
-            self.persist(file_idx).map_err(|_| Errno::EIO)?;
+            self.persist(file_idx).map_err(|_| nfsstat3::NFS3ERR_IO)?;
         }
         Ok(())
     }
 
-    fn attr(&self, ino: u64, kind: FileType, size: u64) -> FileAttr {
-        let now = SystemTime::now();
-        let perm = match kind {
-            FileType::Directory => 0o755,
+    fn attr(&self, ino: u64, kind: ftype3, size: u64) -> fattr3 {
+        let now = nfs_now();
+        let mode = match kind {
+            ftype3::NF3DIR if self.allow_other => 0o777,
+            ftype3::NF3DIR => 0o755,
             _ if self.readonly => 0o444,
+            _ if self.allow_other => 0o666,
             _ => 0o644,
         };
-        FileAttr {
-            ino: INodeNo(ino),
-            size,
-            blocks: size.div_ceil(512),
-            atime: now,
-            mtime: now,
-            ctime: now,
-            crtime: now,
-            kind,
-            perm,
+        fattr3 {
+            ftype: kind,
+            mode,
             nlink: 1,
             uid: self.uid,
             gid: self.gid,
-            rdev: 0,
-            blksize: 512,
-            flags: 0,
+            size,
+            used: size,
+            rdev: specdata3::default(),
+            fsid: 0,
+            fileid: ino,
+            atime: now,
+            mtime: now,
+            ctime: now,
         }
     }
 
-    fn attr_for(&self, file_idx: usize, ino: u64, path: &MountPath) -> FileAttr {
+    fn attr_for(&self, file_idx: usize, ino: u64, path: &MountPath) -> fattr3 {
         match path {
-            MountPath::Dir(_) => self.attr(ino, FileType::Directory, 0),
-            MountPath::Content(p) => self.attr(ino, FileType::RegularFile, self.section_bytes(file_idx, p).len() as u64),
-            MountPath::FrontMatter(kind) => {
-                let size = self.files[file_idx]
-                    .tree
-                    .front_matter
-                    .filter(|(k, _)| k == kind)
-                    .map(|(_, idx)| self.files[file_idx].document.frontmatter_value(idx).len())
-                    .unwrap_or(0);
-                self.attr(ino, FileType::RegularFile, size as u64)
-            }
+            MountPath::Dir(_) => self.attr(ino, ftype3::NF3DIR, 0),
+            MountPath::Content(p) => self.attr(ino, ftype3::NF3REG, self.section_bytes(file_idx, p).len() as u64),
+            MountPath::FrontMatter(kind) => self.attr(ino, ftype3::NF3REG, self.frontmatter_bytes(file_idx, *kind).len() as u64),
         }
     }
 }
 
-fn map_mutation_error(e: MutationError) -> Errno {
+fn nfs_now() -> nfstime3 {
+    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    nfstime3 {
+        seconds: d.as_secs() as u32,
+        nseconds: d.subsec_nanos(),
+    }
+}
+
+fn map_mutation_error(e: MutationError) -> nfsstat3 {
     match e {
-        MutationError::AlreadyExists(_) => Errno::EEXIST,
-        MutationError::NotEmpty => Errno::ENOTEMPTY,
-        MutationError::NotADirectory => Errno::ENOTDIR,
-        MutationError::Parse(_) => Errno::EINVAL,
+        MutationError::AlreadyExists(_) => nfsstat3::NFS3ERR_EXIST,
+        MutationError::NotEmpty => nfsstat3::NFS3ERR_NOTEMPTY,
+        MutationError::NotADirectory => nfsstat3::NFS3ERR_NOTDIR,
+        MutationError::Parse(_) => nfsstat3::NFS3ERR_INVAL,
     }
 }
 
@@ -301,14 +264,30 @@ fn frontmatter_kind_for_name(name: &str) -> Option<FrontMatterKind> {
         .find(|k| k.file_name() == name)
 }
 
-/// Emits `entries` into a readdir reply starting at `offset`, stopping early
-/// if the reply buffer fills up.
-fn emit_entries(reply: &mut ReplyDirectory, entries: Vec<(u64, FileType, String)>, offset: u64) {
-    for (i, (entry_ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
-        if reply.add(INodeNo(entry_ino), (i + 1) as u64, kind, &name) {
-            break;
-        }
+fn name_str(name: &filename3) -> Result<&str, nfsstat3> {
+    std::str::from_utf8(name.as_ref()).map_err(|_| nfsstat3::NFS3ERR_INVAL)
+}
+
+fn splice(buf: &mut Vec<u8>, offset: usize, data: &[u8]) {
+    if offset + data.len() > buf.len() {
+        buf.resize(offset + data.len(), 0);
     }
+    buf[offset..offset + data.len()].copy_from_slice(data);
+}
+
+fn paginate(entries: Vec<DirEntry>, start_after: fileid3, max_entries: usize) -> ReadDirResult {
+    let start_index = if start_after == 0 {
+        0
+    } else {
+        match entries.iter().position(|e| e.fileid == start_after) {
+            Some(i) => i + 1,
+            None => entries.len(),
+        }
+    };
+    let max_entries = max_entries.max(1);
+    let end = entries.len().saturating_sub(start_index) <= max_entries;
+    let page = entries.into_iter().skip(start_index).take(max_entries).collect();
+    ReadDirResult { entries: page, end }
 }
 
 pub struct MqFs {
@@ -316,35 +295,60 @@ pub struct MqFs {
 }
 
 impl MqFs {
-    pub fn new(source_paths: Vec<PathBuf>, readonly: bool) -> std::io::Result<Self> {
+    pub fn new(source_paths: Vec<PathBuf>, readonly: bool, allow_other: bool) -> std::io::Result<Self> {
         Ok(Self {
-            state: Mutex::new(MountState::open(source_paths, readonly)?),
+            state: Mutex::new(MountState::open(source_paths, readonly, allow_other)?),
         })
     }
 }
 
-impl Filesystem for MqFs {
-    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let state = self.state.lock().unwrap();
-        let Some(name) = name.to_str() else {
-            reply.error(Errno::EINVAL);
-            return;
-        };
+#[async_trait]
+impl NFSFileSystem for MqFs {
+    fn capabilities(&self) -> VFSCapabilities {
+        if self.state.lock().unwrap().readonly {
+            VFSCapabilities::ReadOnly
+        } else {
+            VFSCapabilities::ReadWrite
+        }
+    }
 
-        if parent.0 == ROOT_INO {
-            let Some(&(_, ino)) = state.root_children.iter().find(|(slug, _)| slug == name) else {
-                reply.error(Errno::ENOENT);
-                return;
-            };
-            reply.entry(&TTL, &state.attr(ino, FileType::Directory, 0), Generation(0));
-            return;
+    fn root_dir(&self) -> fileid3 {
+        ROOT_INO
+    }
+
+    async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
+        let state = self.state.lock().unwrap();
+        let name = name_str(filename)?;
+        tracing::debug!("lookup(dirid={dirid}, name={name:?})");
+
+        if name == "." {
+            return Ok(dirid);
+        }
+        if name == ".." {
+            if dirid == ROOT_INO {
+                return Ok(ROOT_INO);
+            }
+            let (file_idx, path) = state.dir_path(dirid).ok_or(nfsstat3::NFS3ERR_NOTDIR)?;
+            return Ok(if path.is_empty() {
+                ROOT_INO
+            } else {
+                state.files[file_idx]
+                    .inodes
+                    .ino_for(&MountPath::Dir(path[..path.len() - 1].to_vec()))
+                    .unwrap_or(ROOT_INO)
+            });
         }
 
-        let Some((file_idx, parent_path)) = state.dir_path(parent.0) else {
-            reply.error(Errno::ENOTDIR);
-            return;
-        };
+        if dirid == ROOT_INO {
+            return state
+                .root_children
+                .iter()
+                .find(|(slug, _)| slug == name)
+                .map(|&(_, ino)| ino)
+                .ok_or(nfsstat3::NFS3ERR_NOENT);
+        }
 
+        let (file_idx, parent_path) = state.dir_path(dirid).ok_or(nfsstat3::NFS3ERR_NOTDIR)?;
         let child_path = if name == document::CONTENT_FILE {
             MountPath::Content(parent_path)
         } else if parent_path.is_empty()
@@ -359,218 +363,249 @@ impl Filesystem for MqFs {
             p.push(name.to_string());
             MountPath::Dir(p)
         } else {
-            reply.error(Errno::ENOENT);
-            return;
+            return Err(nfsstat3::NFS3ERR_NOENT);
         };
 
-        match state.files[file_idx].inodes.ino_for(&child_path) {
-            Some(ino) => reply.entry(&TTL, &state.attr_for(file_idx, ino, &child_path), Generation(0)),
-            None => reply.error(Errno::ENOENT),
-        }
+        state.files[file_idx].inodes.ino_for(&child_path).ok_or(nfsstat3::NFS3ERR_NOENT)
     }
 
-    fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FuserFileHandle>, reply: ReplyAttr) {
+    async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
         let state = self.state.lock().unwrap();
-        if let Some(fh) = fh
-            && let Some(Handle::Scratch { buf }) = state.handles.get(&fh.0)
-        {
-            reply.attr(&TTL, &state.attr(ino.0, FileType::RegularFile, buf.len() as u64));
-            return;
+        if let Some(buf) = state.scratch.get(&id) {
+            tracing::debug!("getattr({id}): scratch, {} bytes", buf.len());
+            return Ok(state.attr(id, ftype3::NF3REG, buf.len() as u64));
         }
-        if ino.0 == ROOT_INO {
-            reply.attr(&TTL, &state.attr(ino.0, FileType::Directory, 0));
-            return;
+        if id == ROOT_INO {
+            return Ok(state.attr(id, ftype3::NF3DIR, 0));
         }
-        match state.path_for_ino(ino.0) {
-            Some((file_idx, path)) => reply.attr(&TTL, &state.attr_for(file_idx, ino.0, &path)),
-            None => reply.error(Errno::ENOENT),
-        }
+        let (file_idx, path) = state.path_for_ino(id).ok_or_else(|| {
+            tracing::debug!("getattr({id}): no path for this fileid");
+            nfsstat3::NFS3ERR_NOENT
+        })?;
+        let attr = state.attr_for(file_idx, id, &path);
+        tracing::debug!("getattr({id}): path={path:?} size={}", attr.size);
+        Ok(attr)
     }
 
-    fn setattr(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
-        size: Option<u64>,
-        _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
-        _ctime: Option<SystemTime>,
-        fh: Option<FuserFileHandle>,
-        _crtime: Option<SystemTime>,
-        _chgtime: Option<SystemTime>,
-        _bkuptime: Option<SystemTime>,
-        _flags: Option<fuser::BsdFileFlags>,
-        reply: ReplyAttr,
-    ) {
+    async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
         let mut state = self.state.lock().unwrap();
         if state.readonly {
-            reply.error(Errno::EROFS);
-            return;
+            return Err(nfsstat3::NFS3ERR_ROFS);
         }
-        if let Some(0) = size {
-            // O_TRUNC: prefer clearing the live buffer of an already-open handle
-            // (write()s that follow will rebuild it); otherwise clear the
-            // underlying section directly.
-            if let Some(fh) = fh
-                && let Some(handle) = state.handles.get_mut(&fh.0)
-            {
-                match handle {
-                    Handle::Content { buf, dirty, .. } | Handle::FrontMatter { buf, dirty, .. } => {
-                        buf.clear();
-                        *dirty = true;
-                    }
-                    Handle::Scratch { buf } => buf.clear(),
-                    Handle::Dir => {}
-                }
-            } else if let Some((file_idx, path)) = state.path_for_ino(ino.0) {
-                let result = match &path {
-                    MountPath::Content(p) => state.commit_content(file_idx, p, ""),
-                    MountPath::FrontMatter(kind) => state.commit_frontmatter(file_idx, *kind, ""),
-                    MountPath::Dir(_) => Err(Errno::EISDIR),
-                };
-                if let Err(e) = result {
-                    reply.error(e);
-                    return;
+        tracing::debug!("setattr({id}): size={:?}", setattr.size);
+        if let set_size3::size(0) = setattr.size {
+            tracing::debug!("setattr({id}): truncating to 0");
+            if let Some(buf) = state.scratch.get_mut(&id) {
+                buf.clear();
+            } else if let Some((file_idx, path)) = state.path_for_ino(id) {
+                match &path {
+                    MountPath::Content(p) => state.commit_content(file_idx, p, "")?,
+                    MountPath::FrontMatter(kind) => state.commit_frontmatter(file_idx, *kind, "")?,
+                    MountPath::Dir(_) => return Err(nfsstat3::NFS3ERR_ISDIR),
                 }
             }
         }
-        if ino.0 == ROOT_INO {
-            reply.attr(&TTL, &state.attr(ino.0, FileType::Directory, 0));
-            return;
+        if let Some(buf) = state.scratch.get(&id) {
+            return Ok(state.attr(id, ftype3::NF3REG, buf.len() as u64));
         }
-        match state.path_for_ino(ino.0) {
-            Some((file_idx, path)) => reply.attr(&TTL, &state.attr_for(file_idx, ino.0, &path)),
-            None => reply.error(Errno::ENOENT),
+        if id == ROOT_INO {
+            return Ok(state.attr(id, ftype3::NF3DIR, 0));
         }
+        let (file_idx, path) = state.path_for_ino(id).ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        Ok(state.attr_for(file_idx, id, &path))
     }
 
-    fn readlink(&self, _req: &Request, _ino: INodeNo, reply: ReplyData) {
-        reply.error(Errno::ENOSYS);
-    }
-
-    fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
-        let mut state = self.state.lock().unwrap();
-        if state.readonly {
-            reply.error(Errno::EROFS);
-            return;
-        }
-        if parent.0 == ROOT_INO {
-            // No backing source file to create: the top-level layout is fixed
-            // at mount time, one directory per mounted file.
-            reply.error(Errno::EPERM);
-            return;
-        }
-        let (Some(name), Some((file_idx, parent_path))) = (name.to_str(), state.dir_path(parent.0)) else {
-            reply.error(Errno::ENOENT);
-            return;
-        };
-        let Some(parent_section) = state.find_section(file_idx, &parent_path) else {
-            reply.error(Errno::ENOENT);
-            return;
-        };
-        if let Err(e) = state.files[file_idx].document.insert_heading(&parent_section, name) {
-            reply.error(map_mutation_error(e));
-            return;
-        }
-        state.rebuild(file_idx);
-        if state.persist(file_idx).is_err() {
-            reply.error(Errno::EIO);
-            return;
-        }
-        let mut child_path = parent_path;
-        child_path.push(name.to_string());
-        let dir_path = MountPath::Dir(child_path);
-        match state.files[file_idx].inodes.ino_for(&dir_path) {
-            Some(ino) => reply.entry(&TTL, &state.attr_for(file_idx, ino, &dir_path), Generation(0)),
-            None => reply.error(Errno::EIO),
-        }
-    }
-
-    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let mut state = self.state.lock().unwrap();
-        if state.readonly {
-            reply.error(Errno::EROFS);
-            return;
-        }
-        if parent.0 == ROOT_INO {
-            reply.error(Errno::EPERM);
-            return;
-        }
-        let (Some(name), Some((file_idx, parent_path))) = (name.to_str(), state.dir_path(parent.0)) else {
-            reply.error(Errno::ENOENT);
-            return;
-        };
-        let Some(section) = state.find_child_section(file_idx, &parent_path, name) else {
-            reply.error(Errno::ENOENT);
-            return;
-        };
-        match state.files[file_idx].document.remove_heading(&section) {
-            Ok(()) => {
-                state.rebuild(file_idx);
-                match state.persist(file_idx) {
-                    Ok(()) => reply.ok(),
-                    Err(_) => reply.error(Errno::EIO),
+    async fn read(&self, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3> {
+        let state = self.state.lock().unwrap();
+        let bytes = if let Some(buf) = state.scratch.get(&id) {
+            buf.clone()
+        } else {
+            match state.path_for_ino(id) {
+                Some((file_idx, MountPath::Content(p))) => state.section_bytes(file_idx, &p),
+                Some((file_idx, MountPath::FrontMatter(kind))) => state.frontmatter_bytes(file_idx, kind),
+                Some((_, MountPath::Dir(_))) => return Err(nfsstat3::NFS3ERR_ISDIR),
+                None => {
+                    tracing::debug!("read({id}): no path for this fileid");
+                    return Err(nfsstat3::NFS3ERR_NOENT);
                 }
             }
-            Err(e) => reply.error(map_mutation_error(e)),
+        };
+        tracing::debug!("read({id}, offset={offset}, count={count}): {} bytes available", bytes.len());
+        let offset = offset as usize;
+        if offset >= bytes.len() {
+            return Ok((Vec::new(), true));
         }
+        let end = (offset + count as usize).min(bytes.len());
+        Ok((bytes[offset..end].to_vec(), end >= bytes.len()))
     }
 
-    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
         let mut state = self.state.lock().unwrap();
         if state.readonly {
-            reply.error(Errno::EROFS);
-            return;
+            return Err(nfsstat3::NFS3ERR_ROFS);
         }
-        if parent.0 == ROOT_INO {
-            reply.error(Errno::EPERM);
-            return;
+        let offset = offset as usize;
+
+        if let Some(buf) = state.scratch.get_mut(&id) {
+            splice(buf, offset, data);
+            let len = buf.len() as u64;
+            return Ok(state.attr(id, ftype3::NF3REG, len));
         }
-        let (Some(name), Some((file_idx, parent_path))) = (name.to_str(), state.dir_path(parent.0)) else {
-            reply.error(Errno::ENOENT);
-            return;
-        };
-        let result = if name == document::CONTENT_FILE {
-            state.commit_content(file_idx, &parent_path, "")
+
+        let (file_idx, path) = state.path_for_ino(id).ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        match &path {
+            MountPath::Content(p) => {
+                let mut buf = state.section_bytes(file_idx, p);
+                splice(&mut buf, offset, data);
+                let text = String::from_utf8_lossy(&buf).into_owned();
+                state.commit_content(file_idx, p, &text)?;
+            }
+            MountPath::FrontMatter(kind) => {
+                let mut buf = state.frontmatter_bytes(file_idx, *kind);
+                splice(&mut buf, offset, data);
+                let text = String::from_utf8_lossy(&buf).into_owned();
+                state.commit_frontmatter(file_idx, *kind, &text)?;
+            }
+            MountPath::Dir(_) => return Err(nfsstat3::NFS3ERR_ISDIR),
+        }
+        Ok(state.attr_for(file_idx, id, &path))
+    }
+
+    async fn create(&self, dirid: fileid3, filename: &filename3, _attr: sattr3) -> Result<(fileid3, fattr3), nfsstat3> {
+        let mut state = self.state.lock().unwrap();
+        if state.readonly {
+            return Err(nfsstat3::NFS3ERR_ROFS);
+        }
+        let name = name_str(filename)?;
+        let (file_idx, parent_path) = state.dir_path(dirid).ok_or(nfsstat3::NFS3ERR_NOENT)?;
+
+        let canonical = if name == document::CONTENT_FILE {
+            Some(MountPath::Content(parent_path))
         } else if parent_path.is_empty()
             && let Some(kind) = frontmatter_kind_for_name(name)
         {
-            state.commit_frontmatter(file_idx, kind, "")
+            Some(MountPath::FrontMatter(kind))
         } else {
-            Err(Errno::ENOENT)
+            None
         };
-        match result {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
+        if let Some(mp) = canonical {
+            let ino = state.files[file_idx].inodes.ino_for(&mp).ok_or(nfsstat3::NFS3ERR_IO)?;
+            return Ok((ino, state.attr_for(file_idx, ino, &mp)));
         }
+
+        let key = (dirid, name.to_string());
+        if let Some(&ino) = state.scratch_by_name.get(&key) {
+            let len = state.scratch.get(&ino).map(Vec::len).unwrap_or(0) as u64;
+            return Ok((ino, state.attr(ino, ftype3::NF3REG, len)));
+        }
+        let ino = state.alloc_ino();
+        state.scratch.insert(ino, Vec::new());
+        state.scratch_by_name.insert(key, ino);
+        Ok((ino, state.attr(ino, ftype3::NF3REG, 0)))
     }
 
-    fn rename(
-        &self,
-        _req: &Request,
-        parent: INodeNo,
-        name: &OsStr,
-        newparent: INodeNo,
-        newname: &OsStr,
-        _flags: RenameFlags,
-        reply: ReplyEmpty,
-    ) {
+    async fn create_exclusive(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
         let mut state = self.state.lock().unwrap();
         if state.readonly {
-            reply.error(Errno::EROFS);
-            return;
+            return Err(nfsstat3::NFS3ERR_ROFS);
         }
-        let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
-            reply.error(Errno::EINVAL);
-            return;
+        let name = name_str(filename)?;
+
+        let exists = if dirid == ROOT_INO {
+            state.root_children.iter().any(|(slug, _)| slug == name)
+        } else {
+            let (file_idx, parent_path) = state.dir_path(dirid).ok_or(nfsstat3::NFS3ERR_NOENT)?;
+            name == document::CONTENT_FILE
+                || (parent_path.is_empty() && frontmatter_kind_for_name(name).is_some())
+                || state
+                    .find_section(file_idx, &parent_path)
+                    .is_some_and(|s| s.children.iter().any(|c| c.name == name))
+                || state.scratch_by_name.contains_key(&(dirid, name.to_string()))
         };
-        let Some((dest_file_idx, new_parent_path)) = state.dir_path(newparent.0) else {
-            reply.error(Errno::ENOENT);
-            return;
-        };
+        if exists {
+            return Err(nfsstat3::NFS3ERR_EXIST);
+        }
+
+        let ino = state.alloc_ino();
+        state.scratch.insert(ino, Vec::new());
+        state.scratch_by_name.insert((dirid, name.to_string()), ino);
+        Ok(ino)
+    }
+
+    async fn mkdir(&self, dirid: fileid3, dirname: &filename3) -> Result<(fileid3, fattr3), nfsstat3> {
+        let mut state = self.state.lock().unwrap();
+        if state.readonly {
+            return Err(nfsstat3::NFS3ERR_ROFS);
+        }
+        if dirid == ROOT_INO {
+            return Err(nfsstat3::NFS3ERR_PERM);
+        }
+        let name = name_str(dirname)?;
+        let (file_idx, parent_path) = state.dir_path(dirid).ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        let parent_section = state.find_section(file_idx, &parent_path).ok_or(nfsstat3::NFS3ERR_NOENT)?;
+
+        state.files[file_idx]
+            .document
+            .insert_heading(&parent_section, name)
+            .map_err(map_mutation_error)?;
+        state.rebuild(file_idx);
+        state.persist(file_idx).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+
+        let mut child_path = parent_path;
+        child_path.push(name.to_string());
+        let mp = MountPath::Dir(child_path);
+        let ino = state.files[file_idx].inodes.ino_for(&mp).ok_or(nfsstat3::NFS3ERR_IO)?;
+        Ok((ino, state.attr_for(file_idx, ino, &mp)))
+    }
+
+    async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
+        let mut state = self.state.lock().unwrap();
+        if state.readonly {
+            return Err(nfsstat3::NFS3ERR_ROFS);
+        }
+        let name = name_str(filename)?;
+
+        let key = (dirid, name.to_string());
+        if let Some(ino) = state.scratch_by_name.remove(&key) {
+            state.scratch.remove(&ino);
+            return Ok(());
+        }
+        if dirid == ROOT_INO {
+            return Err(nfsstat3::NFS3ERR_PERM);
+        }
+        let (file_idx, parent_path) = state.dir_path(dirid).ok_or(nfsstat3::NFS3ERR_NOENT)?;
+
+        if name == document::CONTENT_FILE {
+            return state.commit_content(file_idx, &parent_path, "");
+        }
+        if parent_path.is_empty()
+            && let Some(kind) = frontmatter_kind_for_name(name)
+        {
+            return state.commit_frontmatter(file_idx, kind, "");
+        }
+        let section = state
+            .find_child_section(file_idx, &parent_path, name)
+            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        state.files[file_idx].document.remove_heading(&section).map_err(map_mutation_error)?;
+        state.rebuild(file_idx);
+        state.persist(file_idx).map_err(|_| nfsstat3::NFS3ERR_IO)
+    }
+
+    async fn rename(
+        &self,
+        from_dirid: fileid3,
+        from_filename: &filename3,
+        to_dirid: fileid3,
+        to_filename: &filename3,
+    ) -> Result<(), nfsstat3> {
+        let mut state = self.state.lock().unwrap();
+        if state.readonly {
+            return Err(nfsstat3::NFS3ERR_ROFS);
+        }
+        let name = name_str(from_filename)?;
+        let newname = name_str(to_filename)?;
+
+        let (dest_file_idx, new_parent_path) = state.dir_path(to_dirid).ok_or(nfsstat3::NFS3ERR_NOENT)?;
 
         let dest_kind = if newname == document::CONTENT_FILE {
             Some(None)
@@ -581,29 +616,13 @@ impl Filesystem for MqFs {
         };
 
         if let Some(front_matter_kind) = dest_kind {
-            let key = (parent.0, name.to_string());
-            // `clear_source_path` is only set for the "no temp file, this is a
-            // direct rename of a live canonical file" fallback — a handle or
-            // pending-rename buffer already represents a file with no other
-            // backing content to leave behind, so only that case needs the
-            // source explicitly cleared afterwards to complete the move.
-            let (bytes, clear_source_path) = if let Some(&fh) = state.open_by_name.get(&key) {
-                let bytes = match state.handles.get(&fh) {
-                    Some(Handle::Scratch { buf })
-                    | Some(Handle::Content { buf, .. })
-                    | Some(Handle::FrontMatter { buf, .. }) => Some(buf.clone()),
-                    _ => None,
-                };
-                (bytes, None)
-            } else if let Some(buf) = state.pending_renames.remove(&key) {
-                (Some(buf), None)
+            let key = (from_dirid, name.to_string());
+            let (bytes, clear_source_path) = if let Some(ino) = state.scratch_by_name.get(&key).copied() {
+                (state.scratch.get(&ino).cloned(), None)
             } else if name == document::CONTENT_FILE {
-                match state.dir_path(parent.0) {
+                match state.dir_path(from_dirid) {
                     Some((src_file_idx, _)) if src_file_idx != dest_file_idx => {
-                        // content.md can't move between two different mounted
-                        // files' documents, only within one.
-                        reply.error(Errno::EOPNOTSUPP);
-                        return;
+                        return Err(nfsstat3::NFS3ERR_NOTSUPP);
                     }
                     Some((src_file_idx, src_path)) => {
                         let bytes = state.section_bytes(src_file_idx, &src_path);
@@ -615,463 +634,330 @@ impl Filesystem for MqFs {
                 (None, None)
             };
 
-            let Some(bytes) = bytes else {
-                reply.error(Errno::ENOENT);
-                return;
-            };
+            let bytes = bytes.ok_or(nfsstat3::NFS3ERR_NOENT)?;
             let text = String::from_utf8_lossy(&bytes).into_owned();
 
-            let result = match front_matter_kind {
-                None => state.commit_content(dest_file_idx, &new_parent_path, &text),
-                Some(kind) => state.commit_frontmatter(dest_file_idx, kind, &text),
+            match front_matter_kind {
+                None => state.commit_content(dest_file_idx, &new_parent_path, &text)?,
+                Some(kind) => state.commit_frontmatter(dest_file_idx, kind, &text)?,
             }
-            .and_then(|()| match clear_source_path {
-                Some(p) => state.commit_content(dest_file_idx, &p, ""),
-                None => Ok(()),
-            });
-            state.open_by_name.remove(&key);
-            state.pending_renames.remove(&key);
-            match result {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(e),
+            if let Some(p) = clear_source_path {
+                state.commit_content(dest_file_idx, &p, "")?;
             }
-            return;
+            if let Some(ino) = state.scratch_by_name.remove(&key) {
+                state.scratch.remove(&ino);
+            }
+            return Ok(());
         }
 
-        // Not a canonical destination: if the source is itself a scratch file
-        // (an editor's temp file mid-way through a multi-step atomic-save
-        // dance, e.g. `temp1 -> temp2 -> target`), just re-key it rather than
-        // treating this as a heading rename. This is file-boundary-agnostic:
-        // the bytes are opaque until they land on a canonical name above.
-        let src_key = (parent.0, name.to_string());
-        if state.open_by_name.contains_key(&src_key) || state.pending_renames.contains_key(&src_key) {
-            let new_key = (newparent.0, newname.to_string());
-            if let Some(fh) = state.open_by_name.remove(&src_key) {
-                state.open_by_name.insert(new_key.clone(), fh);
-            }
-            if let Some(buf) = state.pending_renames.remove(&src_key) {
-                state.pending_renames.insert(new_key, buf);
-            }
-            reply.ok();
-            return;
+        let src_key = (from_dirid, name.to_string());
+        if let Some(ino) = state.scratch_by_name.remove(&src_key) {
+            state.scratch_by_name.insert((to_dirid, newname.to_string()), ino);
+            return Ok(());
         }
 
-        if parent != newparent {
-            reply.error(Errno::EOPNOTSUPP);
-            return;
+        if from_dirid != to_dirid {
+            return Err(nfsstat3::NFS3ERR_NOTSUPP);
         }
-        // `dir_path(ROOT_INO)` is `None`, so renaming a top-level per-file
-        // directory falls through to ENOENT here — the mounted-file layout is
-        // fixed at mount time.
-        let Some((file_idx, parent_path)) = state.dir_path(parent.0) else {
-            reply.error(Errno::ENOENT);
-            return;
-        };
-        let Some(section) = state.find_child_section(file_idx, &parent_path, name) else {
-            reply.error(Errno::ENOENT);
-            return;
-        };
-        match state.files[file_idx].document.rename_heading(&section, newname) {
-            Ok(()) => {
-                state.rebuild(file_idx);
-                match state.persist(file_idx) {
-                    Ok(()) => reply.ok(),
-                    Err(_) => reply.error(Errno::EIO),
-                }
-            }
-            Err(e) => reply.error(map_mutation_error(e)),
-        }
+        let (file_idx, parent_path) = state.dir_path(from_dirid).ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        let section = state
+            .find_child_section(file_idx, &parent_path, name)
+            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        state.files[file_idx]
+            .document
+            .rename_heading(&section, newname)
+            .map_err(map_mutation_error)?;
+        state.rebuild(file_idx);
+        state.persist(file_idx).map_err(|_| nfsstat3::NFS3ERR_IO)
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, flags: fuser::OpenFlags, reply: ReplyOpen) {
-        let mut state = self.state.lock().unwrap();
-        let wants_write = (flags.0 & libc::O_ACCMODE) != libc::O_RDONLY;
-        if state.readonly && wants_write {
-            reply.error(Errno::EROFS);
-            return;
-        }
-        let Some((file_idx, path)) = state.path_for_ino(ino.0) else {
-            reply.error(Errno::ENOENT);
-            return;
-        };
-        let handle = match &path {
-            MountPath::Content(p) => Handle::Content {
-                file: file_idx,
-                path: p.clone(),
-                buf: state.section_bytes(file_idx, p),
-                dirty: false,
-            },
-            MountPath::FrontMatter(kind) => {
-                let buf = state.files[file_idx]
-                    .tree
-                    .front_matter
-                    .filter(|(k, _)| k == kind)
-                    .map(|(_, idx)| state.files[file_idx].document.frontmatter_value(idx).as_bytes().to_vec())
-                    .unwrap_or_default();
-                Handle::FrontMatter {
-                    file: file_idx,
-                    kind: *kind,
-                    buf,
-                    dirty: false,
-                }
-            }
-            MountPath::Dir(_) => {
-                reply.error(Errno::EISDIR);
-                return;
-            }
-        };
-        let fh = state.alloc_fh();
-        state.handles.insert(fh, handle);
-        reply.opened(FuserFileHandle(fh), fuser::FopenFlags::empty());
-    }
-
-    fn create(
-        &self,
-        _req: &Request,
-        parent: INodeNo,
-        name: &OsStr,
-        _mode: u32,
-        _umask: u32,
-        flags: i32,
-        reply: fuser::ReplyCreate,
-    ) {
-        let mut state = self.state.lock().unwrap();
-        if state.readonly {
-            reply.error(Errno::EROFS);
-            return;
-        }
-        let Some(name) = name.to_str() else {
-            reply.error(Errno::EINVAL);
-            return;
-        };
-        let Some((file_idx, parent_path)) = state.dir_path(parent.0) else {
-            reply.error(Errno::ENOENT);
-            return;
-        };
-        let _ = flags;
-
-        let (handle, path_for_attr) = if name == document::CONTENT_FILE {
-            (
-                Handle::Content {
-                    file: file_idx,
-                    path: parent_path.clone(),
-                    buf: Vec::new(),
-                    dirty: true,
-                },
-                Some(MountPath::Content(parent_path.clone())),
-            )
-        } else if parent_path.is_empty()
-            && let Some(kind) = frontmatter_kind_for_name(name)
-        {
-            (
-                Handle::FrontMatter {
-                    file: file_idx,
-                    kind,
-                    buf: Vec::new(),
-                    dirty: true,
-                },
-                Some(MountPath::FrontMatter(kind)),
-            )
-        } else {
-            // Not a canonical name: stage it as a scratch buffer, most likely
-            // an editor's temp file en route to an atomic-save rename.
-            (Handle::Scratch { buf: Vec::new() }, None)
-        };
-
-        let fh = state.alloc_fh();
-        let key = (parent.0, name.to_string());
-        state.open_by_name.insert(key, fh);
-        state.handles.insert(fh, handle);
-
-        let ino = path_for_attr
-            .as_ref()
-            .and_then(|p| state.files[file_idx].inodes.ino_for(p))
-            .unwrap_or_else(|| {
-                // Scratch files have no place in the document tree; borrow an
-                // inode number from the same never-reused counter by piggy-backing
-                // on the fh space shifted above the inode range used so far. This
-                // is only ever exposed transiently for the lifetime of the handle.
-                u64::MAX - fh
-            });
-        let attr = state.attr(ino, FileType::RegularFile, 0);
-        reply.created(
-            &TTL,
-            &attr,
-            Generation(0),
-            FuserFileHandle(fh),
-            fuser::FopenFlags::empty(),
-        );
-    }
-
-    fn read(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        fh: FuserFileHandle,
-        offset: u64,
-        size: u32,
-        _flags: fuser::OpenFlags,
-        _lock_owner: Option<fuser::LockOwner>,
-        reply: ReplyData,
-    ) {
+    async fn readdir(&self, dirid: fileid3, start_after: fileid3, max_entries: usize) -> Result<ReadDirResult, nfsstat3> {
         let state = self.state.lock().unwrap();
-        let buf = match state.handles.get(&fh.0) {
-            Some(Handle::Content { buf, .. })
-            | Some(Handle::FrontMatter { buf, .. })
-            | Some(Handle::Scratch { buf }) => buf,
-            _ => {
-                reply.error(Errno::EBADF);
-                return;
+        let mut entries: Vec<DirEntry> = Vec::new();
+
+        if dirid == ROOT_INO {
+            for (slug, ino) in &state.root_children {
+                entries.push(DirEntry {
+                    fileid: *ino,
+                    name: filename3::from(slug.as_bytes()),
+                    attr: state.attr(*ino, ftype3::NF3DIR, 0),
+                });
             }
-        };
-        let offset = offset as usize;
-        if offset >= buf.len() {
-            reply.data(&[]);
-            return;
-        }
-        let end = (offset + size as usize).min(buf.len());
-        reply.data(&buf[offset..end]);
-    }
-
-    fn write(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        fh: FuserFileHandle,
-        offset: u64,
-        data: &[u8],
-        _write_flags: fuser::WriteFlags,
-        _flags: fuser::OpenFlags,
-        _lock_owner: Option<fuser::LockOwner>,
-        reply: ReplyWrite,
-    ) {
-        let mut state = self.state.lock().unwrap();
-        if state.readonly {
-            reply.error(Errno::EROFS);
-            return;
-        }
-        let offset = offset as usize;
-        let buf = match state.handles.get_mut(&fh.0) {
-            Some(Handle::Content { buf, dirty, .. }) | Some(Handle::FrontMatter { buf, dirty, .. }) => {
-                *dirty = true;
-                buf
-            }
-            Some(Handle::Scratch { buf }) => buf,
-            _ => {
-                reply.error(Errno::EBADF);
-                return;
-            }
-        };
-        if offset + data.len() > buf.len() {
-            buf.resize(offset + data.len(), 0);
-        }
-        buf[offset..offset + data.len()].copy_from_slice(data);
-        reply.written(data.len() as u32);
-    }
-
-    fn flush(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        fh: FuserFileHandle,
-        _lock_owner: fuser::LockOwner,
-        reply: ReplyEmpty,
-    ) {
-        let mut state = self.state.lock().unwrap();
-        commit_handle_if_dirty(&mut state, fh.0);
-        reply.ok();
-    }
-
-    fn release(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        fh: FuserFileHandle,
-        _flags: fuser::OpenFlags,
-        _lock_owner: Option<fuser::LockOwner>,
-        _flush: bool,
-        reply: ReplyEmpty,
-    ) {
-        let mut state = self.state.lock().unwrap();
-        commit_handle_if_dirty(&mut state, fh.0);
-        let key = state
-            .open_by_name
-            .iter()
-            .find(|&(_, &v)| v == fh.0)
-            .map(|(k, _)| k.clone());
-        if let Some(ref k) = key {
-            state.open_by_name.remove(k);
-        }
-        if let Some(Handle::Scratch { buf }) = state.handles.remove(&fh.0) {
-            // Keep the bytes around in case a rename() targeting a canonical
-            // name arrives after the editor has already closed this handle.
-            if let Some(k) = key {
-                state.pending_renames.insert(k, buf);
-            }
-        }
-        reply.ok();
-    }
-
-    fn opendir(&self, _req: &Request, _ino: INodeNo, _flags: fuser::OpenFlags, reply: ReplyOpen) {
-        let mut state = self.state.lock().unwrap();
-        let fh = state.alloc_fh();
-        state.handles.insert(fh, Handle::Dir);
-        reply.opened(FuserFileHandle(fh), fuser::FopenFlags::empty());
-    }
-
-    fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FuserFileHandle, offset: u64, mut reply: ReplyDirectory) {
-        let state = self.state.lock().unwrap();
-
-        if ino.0 == ROOT_INO {
-            let mut entries: Vec<(u64, FileType, String)> = vec![
-                (ROOT_INO, FileType::Directory, ".".to_string()),
-                (ROOT_INO, FileType::Directory, "..".to_string()),
-            ];
-            for (slug, dir_ino) in &state.root_children {
-                entries.push((*dir_ino, FileType::Directory, slug.clone()));
-            }
-            emit_entries(&mut reply, entries, offset);
-            reply.ok();
-            return;
+            return Ok(paginate(entries, start_after, max_entries));
         }
 
-        let Some((file_idx, path)) = state.dir_path(ino.0) else {
-            reply.error(Errno::ENOTDIR);
-            return;
-        };
-        let Some(section) = state.find_section(file_idx, &path) else {
-            reply.error(Errno::ENOENT);
-            return;
-        };
+        let (file_idx, path) = state.dir_path(dirid).ok_or(nfsstat3::NFS3ERR_NOTDIR)?;
+        let section = state.find_section(file_idx, &path).ok_or(nfsstat3::NFS3ERR_NOENT)?;
 
-        let parent_ino = if path.is_empty() {
-            ROOT_INO
-        } else {
-            state.files[file_idx]
-                .inodes
-                .ino_for(&MountPath::Dir(path[..path.len() - 1].to_vec()))
-                .unwrap_or(ROOT_INO)
-        };
         let content_ino = state.files[file_idx]
             .inodes
             .ino_for(&MountPath::Content(path.clone()))
-            .unwrap_or(ino.0);
+            .unwrap_or(dirid);
+        let content_size = state.section_bytes(file_idx, &path).len() as u64;
 
-        let mut entries: Vec<(u64, FileType, String)> = vec![
-            (ino.0, FileType::Directory, ".".to_string()),
-            (parent_ino, FileType::Directory, "..".to_string()),
-            (content_ino, FileType::RegularFile, document::CONTENT_FILE.to_string()),
-        ];
+        entries.push(DirEntry {
+            fileid: content_ino,
+            name: filename3::from(document::CONTENT_FILE.as_bytes()),
+            attr: state.attr(content_ino, ftype3::NF3REG, content_size),
+        });
+
         if path.is_empty()
             && let Some((kind, _)) = state.files[file_idx].tree.front_matter
+            && let Some(fm_ino) = state.files[file_idx].inodes.ino_for(&MountPath::FrontMatter(kind))
         {
-            let mp = MountPath::FrontMatter(kind);
-            if let Some(fm_ino) = state.files[file_idx].inodes.ino_for(&mp) {
-                entries.push((fm_ino, FileType::RegularFile, kind.file_name().to_string()));
-            }
+            let size = state.frontmatter_bytes(file_idx, kind).len() as u64;
+            entries.push(DirEntry {
+                fileid: fm_ino,
+                name: filename3::from(kind.file_name().as_bytes()),
+                attr: state.attr(fm_ino, ftype3::NF3REG, size),
+            });
         }
+
         for child in &section.children {
-            if let Some(child_ino) = state.files[file_idx].inodes.ino_for(&MountPath::Dir({
-                let mut p = path.clone();
-                p.push(child.name.clone());
-                p
-            })) {
-                entries.push((child_ino, FileType::Directory, child.name.clone()));
+            let mut p = path.clone();
+            p.push(child.name.clone());
+            if let Some(child_ino) = state.files[file_idx].inodes.ino_for(&MountPath::Dir(p)) {
+                entries.push(DirEntry {
+                    fileid: child_ino,
+                    name: filename3::from(child.name.as_bytes()),
+                    attr: state.attr(child_ino, ftype3::NF3DIR, 0),
+                });
             }
         }
 
-        emit_entries(&mut reply, entries, offset);
-        reply.ok();
+        Ok(paginate(entries, start_after, max_entries))
     }
 
-    fn releasedir(
+    async fn symlink(
         &self,
-        _req: &Request,
-        _ino: INodeNo,
-        fh: FuserFileHandle,
-        _flags: fuser::OpenFlags,
-        reply: ReplyEmpty,
-    ) {
-        self.state.lock().unwrap().handles.remove(&fh.0);
-        reply.ok();
+        _dirid: fileid3,
+        _linkname: &filename3,
+        _symlink: &nfspath3,
+        _attr: &sattr3,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
+        Err(nfsstat3::NFS3ERR_NOTSUPP)
     }
 
-    fn fsync(&self, _req: &Request, _ino: INodeNo, _fh: FuserFileHandle, _datasync: bool, reply: ReplyEmpty) {
-        reply.ok();
-    }
-
-    fn fsyncdir(&self, _req: &Request, _ino: INodeNo, _fh: FuserFileHandle, _datasync: bool, reply: ReplyEmpty) {
-        reply.ok();
-    }
-
-    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-        reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
-    }
-
-    fn access(&self, _req: &Request, ino: INodeNo, _mask: fuser::AccessFlags, reply: ReplyEmpty) {
-        let state = self.state.lock().unwrap();
-        if state.ino_exists(ino.0) {
-            reply.ok();
-        } else {
-            reply.error(Errno::ENOENT);
-        }
-    }
-
-    fn getxattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, _size: u32, reply: ReplyXattr) {
-        reply.error(Errno::NO_XATTR);
-    }
-
-    fn listxattr(&self, _req: &Request, _ino: INodeNo, _size: u32, reply: ReplyXattr) {
-        reply.size(0);
-    }
-
-    fn setxattr(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _name: &OsStr,
-        _value: &[u8],
-        _flags: i32,
-        _position: u32,
-        reply: ReplyEmpty,
-    ) {
-        reply.error(Errno::ENOSYS);
-    }
-
-    fn destroy(&mut self) {
-        let mut state = self.state.lock().unwrap();
-        let fhs: Vec<u64> = state.handles.keys().copied().collect();
-        for fh in fhs {
-            commit_handle_if_dirty(&mut state, fh);
-        }
+    async fn readlink(&self, _id: fileid3) -> Result<nfspath3, nfsstat3> {
+        Err(nfsstat3::NFS3ERR_INVAL)
     }
 }
 
-fn commit_handle_if_dirty(state: &mut MountState, fh: u64) {
-    let (file_idx, front_matter_kind, path, text) = match state.handles.get(&fh) {
-        Some(Handle::Content { file, path, dirty: true, buf }) => (
-            Some(*file),
-            None,
-            Some(path.clone()),
-            Some(String::from_utf8_lossy(buf).into_owned()),
-        ),
-        Some(Handle::FrontMatter { file, kind, dirty: true, buf }) => {
-            (Some(*file), Some(*kind), None, Some(String::from_utf8_lossy(buf).into_owned()))
+#[cfg(test)]
+mod tests {
+    use nfsserve::nfs::filename3;
+
+    use super::*;
+
+    /// Mounts `content` as a single file and returns the filesystem, the
+    /// tempdir keeping its source path alive, and the fileid of that file's
+    /// own top-level directory.
+    async fn mounted(content: &str) -> (MqFs, tempfile::TempDir, fileid3) {
+        mounted_with(content, false, false).await
+    }
+
+    async fn mounted_with(content: &str, readonly: bool, allow_other: bool) -> (MqFs, tempfile::TempDir, fileid3) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, content).unwrap();
+        let fs = MqFs::new(vec![path.clone()], readonly, allow_other).unwrap();
+        let listing = fs.readdir(fs.root_dir(), 0, 100).await.unwrap();
+        let file_ino = listing.entries[0].fileid;
+        (fs, dir, file_ino)
+    }
+
+    fn name(s: &str) -> filename3 {
+        filename3::from(s.as_bytes())
+    }
+
+    async fn lookup_path(fs: &MqFs, mut dirid: fileid3, path: &[&str]) -> fileid3 {
+        for part in path {
+            dirid = fs.lookup(dirid, &name(part)).await.unwrap();
         }
-        _ => (None, None, None, None),
-    };
-    let (Some(file_idx), Some(text)) = (file_idx, text) else { return };
-    let result = match (path, front_matter_kind) {
-        (Some(p), _) => state.commit_content(file_idx, &p, &text),
-        (None, Some(kind)) => state.commit_frontmatter(file_idx, kind, &text),
-        _ => Ok(()),
-    };
-    if result.is_ok()
-        && let Some(handle) = state.handles.get_mut(&fh)
-    {
-        match handle {
-            Handle::Content { dirty, .. } | Handle::FrontMatter { dirty, .. } => *dirty = false,
-            _ => {}
+        dirid
+    }
+
+    #[tokio::test]
+    async fn write_then_read_round_trips_through_content_md() {
+        let (fs, dir, file_ino) = mounted("# Title\n\noriginal body\n").await;
+        let content_ino = lookup_path(&fs, file_ino, &["Title", document::CONTENT_FILE]).await;
+
+        // `write` only overwrites the byte range it's given, like a real
+        // write(2) — a whole-file save (shell redirection, an editor) always
+        // truncates first, same as O_TRUNC would.
+        fs.setattr(
+            content_ino,
+            sattr3 {
+                size: set_size3::size(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        fs.write(content_ino, 0, b"new body\n").await.unwrap();
+        let (bytes, eof) = fs.read(content_ino, 0, 1024).await.unwrap();
+        assert_eq!(bytes, b"new body\n");
+        assert!(eof);
+
+        let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
+        assert!(persisted.contains("new body"), "persisted doc was: {persisted}");
+    }
+
+    #[tokio::test]
+    async fn mkdir_adds_a_heading_visible_in_readdir_and_on_disk() {
+        let (fs, dir, file_ino) = mounted("# Title\n\nbody\n").await;
+        let title_ino = fs.lookup(file_ino, &name("Title")).await.unwrap();
+
+        let (sub_ino, attr) = fs.mkdir(title_ino, &name("Sub")).await.unwrap();
+        assert_eq!(attr.ftype as u32, ftype3::NF3DIR as u32);
+
+        let listing = fs.readdir(title_ino, 0, 100).await.unwrap();
+        assert!(listing.entries.iter().any(|e| e.fileid == sub_ino && e.name.0 == b"Sub"));
+
+        let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
+        assert!(persisted.contains("Sub"), "persisted doc was: {persisted}");
+    }
+
+    #[tokio::test]
+    async fn remove_rejects_nonempty_directory() {
+        let (fs, _dir, file_ino) = mounted("# A\n\n## B\n\nbody\n").await;
+
+        let err = fs.remove(file_ino, &name("A")).await.unwrap_err();
+        assert!(matches!(err, nfsstat3::NFS3ERR_NOTEMPTY));
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_an_empty_heading() {
+        let (fs, _dir, file_ino) = mounted("# A\n\n# B\n").await;
+        fs.remove(file_ino, &name("A")).await.unwrap();
+        assert!(matches!(fs.lookup(file_ino, &name("A")).await, Err(nfsstat3::NFS3ERR_NOENT)));
+        assert!(fs.lookup(file_ino, &name("B")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn rename_renames_a_heading_and_persists() {
+        let (fs, dir, file_ino) = mounted("# Old\n\nbody\n").await;
+        fs.rename(file_ino, &name("Old"), file_ino, &name("New")).await.unwrap();
+
+        assert!(matches!(fs.lookup(file_ino, &name("Old")).await, Err(nfsstat3::NFS3ERR_NOENT)));
+        assert!(fs.lookup(file_ino, &name("New")).await.is_ok());
+        let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
+        assert!(persisted.contains("New"));
+    }
+
+    #[tokio::test]
+    async fn atomic_save_via_scratch_rename_commits_content() {
+        let (fs, dir, file_ino) = mounted("# Title\n\noriginal\n").await;
+        let title_ino = fs.lookup(file_ino, &name("Title")).await.unwrap();
+
+        let (tmp_ino, _attr) = fs.create(title_ino, &name(".tmp"), sattr3::default()).await.unwrap();
+        fs.write(tmp_ino, 0, b"saved via temp file\n").await.unwrap();
+        fs.rename(title_ino, &name(".tmp"), title_ino, &name(document::CONTENT_FILE))
+            .await
+            .unwrap();
+
+        let content_ino = fs.lookup(title_ino, &name(document::CONTENT_FILE)).await.unwrap();
+        let (bytes, _) = fs.read(content_ino, 0, 1024).await.unwrap();
+        assert_eq!(bytes, b"saved via temp file\n");
+
+        let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
+        assert!(persisted.contains("saved via temp file"), "persisted doc was: {persisted}");
+    }
+
+    #[tokio::test]
+    async fn readonly_mount_rejects_every_mutation() {
+        let (fs, _dir, file_ino) = mounted_with("# Title\n\nbody\n", true, false).await;
+        let title_ino = fs.lookup(file_ino, &name("Title")).await.unwrap();
+        let content_ino = fs.lookup(title_ino, &name(document::CONTENT_FILE)).await.unwrap();
+
+        assert!(matches!(fs.write(content_ino, 0, b"x").await, Err(nfsstat3::NFS3ERR_ROFS)));
+        assert!(matches!(
+            fs.create(title_ino, &name("x"), sattr3::default()).await,
+            Err(nfsstat3::NFS3ERR_ROFS)
+        ));
+        assert!(matches!(fs.mkdir(title_ino, &name("Sub")).await, Err(nfsstat3::NFS3ERR_ROFS)));
+        assert!(matches!(fs.remove(title_ino, &name("content.md")).await, Err(nfsstat3::NFS3ERR_ROFS)));
+        assert!(matches!(
+            fs.rename(file_ino, &name("Title"), file_ino, &name("Renamed")).await,
+            Err(nfsstat3::NFS3ERR_ROFS)
+        ));
+    }
+
+    #[tokio::test]
+    async fn setattr_size_zero_truncates_content() {
+        let (fs, dir, file_ino) = mounted("# Title\n\nbody\n").await;
+        let content_ino = lookup_path(&fs, file_ino, &["Title", document::CONTENT_FILE]).await;
+
+        fs.setattr(
+            content_ino,
+            sattr3 {
+                size: set_size3::size(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let (bytes, eof) = fs.read(content_ino, 0, 1024).await.unwrap();
+        assert!(bytes.is_empty());
+        assert!(eof);
+        let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
+        assert!(!persisted.contains("body"), "persisted doc was: {persisted}");
+    }
+
+    #[tokio::test]
+    async fn create_exclusive_rejects_an_existing_canonical_name() {
+        let (fs, _dir, file_ino) = mounted("# Title\n\nbody\n").await;
+        let err = fs.create_exclusive(file_ino, &name(document::CONTENT_FILE)).await.unwrap_err();
+        assert!(matches!(err, nfsstat3::NFS3ERR_EXIST));
+    }
+
+    #[tokio::test]
+    async fn root_directory_rejects_structural_mutations() {
+        let (fs, _dir, _file_ino) = mounted("# Title\n\nbody\n").await;
+        assert!(matches!(fs.mkdir(ROOT_INO, &name("x")).await, Err(nfsstat3::NFS3ERR_PERM)));
+        assert!(matches!(fs.remove(ROOT_INO, &name("x")).await, Err(nfsstat3::NFS3ERR_PERM)));
+    }
+
+    #[tokio::test]
+    async fn readdir_pagination_visits_every_entry_exactly_once_with_max_entries_one() {
+        let (fs, _dir, file_ino) = mounted("# A\n\n# B\n\n# C\n\n# D\n").await;
+
+        let mut seen = Vec::new();
+        let mut cookie: fileid3 = 0;
+        loop {
+            let page = fs.readdir(file_ino, cookie, 1).await.unwrap();
+            assert!(page.entries.len() <= 1);
+            for e in &page.entries {
+                seen.push(e.fileid);
+                cookie = e.fileid;
+            }
+            if page.end {
+                break;
+            }
+            if seen.len() > 20 {
+                panic!("readdir pagination did not converge: {seen:?}");
+            }
         }
+
+        let mut unique = seen.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(seen.len(), unique.len(), "pagination revisited an entry: {seen:?}");
+        // content.md + A, B, C, D
+        assert_eq!(seen.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn frontmatter_write_then_read_round_trips() {
+        let (fs, dir, file_ino) = mounted("---\nkey: 1\n---\n# Title\n\nbody\n").await;
+        let fm_ino = fs.lookup(file_ino, &name("_frontmatter.yaml")).await.unwrap();
+
+        fs.write(fm_ino, 0, b"key: 2").await.unwrap();
+        let (bytes, _) = fs.read(fm_ino, 0, 1024).await.unwrap();
+        assert_eq!(bytes, b"key: 2");
+
+        let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
+        assert!(persisted.contains("key: 2"), "persisted doc was: {persisted}");
     }
 }

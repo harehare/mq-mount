@@ -17,21 +17,20 @@ path = "src/main.rs"
 
 [features]
 default = ["mount"]
-# The actual FUSE binding. Split out because `fuser`'s build script requires
-# libfuse/macFUSE's pkg-config file to be present just to *compile*, not only
-# to run — gating it lets `document`/`inode`'s core logic build and test on a
-# machine without macFUSE installed (e.g. plain CI, or before a contributor
-# has set up macFUSE locally).
-mount = ["dep:fuser"]
+# The NFSv3-server-backed mount. Split out so `document`/`inode`'s core logic
+# builds and tests without pulling in the server/runtime dependencies.
+mount = ["dep:nfsserve", "dep:tokio", "dep:async-trait"]
 
 [dependencies]
+async-trait = { version = "0.1.92", optional = true }
 clap = {version = "4.6.1", features = ["derive"]}
-fuser = {version = "0.18", optional = true}
 libc = "0.2"
 miette = {version = "7.6.0", features = ["fancy"]}
 mq-markdown = "0.8.2"
+nfsserve = { version = "0.11.0", optional = true }
 rustc-hash = "2.1.2"
 thiserror = "2.0.18"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "signal"], optional = true }
 tracing = "0.1.44"
 tracing-subscriber = {version = "0.3.23", features = ["env-filter"]}
 
