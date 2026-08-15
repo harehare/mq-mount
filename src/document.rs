@@ -413,7 +413,8 @@ mod tests {
         let mut doc = Document::parse("# Title\n\n## A\n\nold\n\n## B\n\nb body\n").unwrap();
         let tree = doc.tree();
         let a = tree.find(&["Title", "A"]).unwrap();
-        doc.replace_section_content(a.own_content_range.clone(), "new\n").unwrap();
+        doc.replace_section_content(a.own_content_range.clone(), "new\n")
+            .unwrap();
 
         let reparsed = Document::parse(&doc.render()).unwrap();
         let tree = reparsed.tree();

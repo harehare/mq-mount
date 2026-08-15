@@ -61,7 +61,10 @@ mod app {
 
         let source_paths = files
             .iter()
-            .map(|f| f.canonicalize().map_err(|e| miette::miette!("failed to resolve {}: {e}", f.display())))
+            .map(|f| {
+                f.canonicalize()
+                    .map_err(|e| miette::miette!("failed to resolve {}: {e}", f.display()))
+            })
             .collect::<miette::Result<Vec<_>>>()?;
         let filesystem = MqFs::new(source_paths.clone(), cli.readonly, cli.allow_other)
             .map_err(|e| miette::miette!("failed to read source file(s): {e}"))?;
@@ -102,7 +105,12 @@ mod app {
         if readonly {
             opts.push_str(",ro");
         }
-        run_mount_command(Command::new("mount_nfs").args(["-o", &opts, "localhost:/mq-mount", &mountpoint.to_string_lossy()]))
+        run_mount_command(Command::new("mount_nfs").args([
+            "-o",
+            &opts,
+            "localhost:/mq-mount",
+            &mountpoint.to_string_lossy(),
+        ]))
     }
 
     #[cfg(target_os = "linux")]
@@ -122,7 +130,9 @@ mod app {
     }
 
     fn run_mount_command(cmd: &mut Command) -> miette::Result<()> {
-        let status = cmd.status().map_err(|e| miette::miette!("failed to run mount command: {e}"))?;
+        let status = cmd
+            .status()
+            .map_err(|e| miette::miette!("failed to run mount command: {e}"))?;
         if !status.success() {
             miette::bail!("failed to mount: mount command exited with {status}");
         }

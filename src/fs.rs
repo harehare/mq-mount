@@ -79,8 +79,10 @@ impl MountState {
             });
         }
 
-        let root_children: Vec<(String, u64)> =
-            files.iter().map(|f| (f.slug.clone(), f.inodes.root_dir_ino())).collect();
+        let root_children: Vec<(String, u64)> = files
+            .iter()
+            .map(|f| (f.slug.clone(), f.inodes.root_dir_ino()))
+            .collect();
         let mut ino_owner = FxHashMap::default();
         for (idx, f) in files.iter().enumerate() {
             for (ino, _) in f.inodes.entries() {
@@ -164,7 +166,10 @@ impl MountState {
 
     fn section_range(&self, file_idx: usize, path: &[String]) -> Option<Range<usize>> {
         let refs: Vec<&str> = path.iter().map(String::as_str).collect();
-        self.files[file_idx].tree.find(&refs).map(|s| s.own_content_range.clone())
+        self.files[file_idx]
+            .tree
+            .find(&refs)
+            .map(|s| s.own_content_range.clone())
     }
 
     fn section_bytes(&self, file_idx: usize, path: &[String]) -> Vec<u8> {
@@ -236,7 +241,11 @@ impl MountState {
         match path {
             MountPath::Dir(_) => self.attr(ino, ftype3::NF3DIR, 0),
             MountPath::Content(p) => self.attr(ino, ftype3::NF3REG, self.section_bytes(file_idx, p).len() as u64),
-            MountPath::FrontMatter(kind) => self.attr(ino, ftype3::NF3REG, self.frontmatter_bytes(file_idx, *kind).len() as u64),
+            MountPath::FrontMatter(kind) => self.attr(
+                ino,
+                ftype3::NF3REG,
+                self.frontmatter_bytes(file_idx, *kind).len() as u64,
+            ),
         }
     }
 }
@@ -366,7 +375,10 @@ impl NFSFileSystem for MqFs {
             return Err(nfsstat3::NFS3ERR_NOENT);
         };
 
-        state.files[file_idx].inodes.ino_for(&child_path).ok_or(nfsstat3::NFS3ERR_NOENT)
+        state.files[file_idx]
+            .inodes
+            .ino_for(&child_path)
+            .ok_or(nfsstat3::NFS3ERR_NOENT)
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
@@ -430,7 +442,10 @@ impl NFSFileSystem for MqFs {
                 }
             }
         };
-        tracing::debug!("read({id}, offset={offset}, count={count}): {} bytes available", bytes.len());
+        tracing::debug!(
+            "read({id}, offset={offset}, count={count}): {} bytes available",
+            bytes.len()
+        );
         let offset = offset as usize;
         if offset >= bytes.len() {
             return Ok((Vec::new(), true));
@@ -542,7 +557,9 @@ impl NFSFileSystem for MqFs {
         }
         let name = name_str(dirname)?;
         let (file_idx, parent_path) = state.dir_path(dirid).ok_or(nfsstat3::NFS3ERR_NOENT)?;
-        let parent_section = state.find_section(file_idx, &parent_path).ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        let parent_section = state
+            .find_section(file_idx, &parent_path)
+            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
 
         state.files[file_idx]
             .document
@@ -586,7 +603,10 @@ impl NFSFileSystem for MqFs {
         let section = state
             .find_child_section(file_idx, &parent_path, name)
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
-        state.files[file_idx].document.remove_heading(&section).map_err(map_mutation_error)?;
+        state.files[file_idx]
+            .document
+            .remove_heading(&section)
+            .map_err(map_mutation_error)?;
         state.rebuild(file_idx);
         state.persist(file_idx).map_err(|_| nfsstat3::NFS3ERR_IO)
     }
@@ -671,7 +691,12 @@ impl NFSFileSystem for MqFs {
         state.persist(file_idx).map_err(|_| nfsstat3::NFS3ERR_IO)
     }
 
-    async fn readdir(&self, dirid: fileid3, start_after: fileid3, max_entries: usize) -> Result<ReadDirResult, nfsstat3> {
+    async fn readdir(
+        &self,
+        dirid: fileid3,
+        start_after: fileid3,
+        max_entries: usize,
+    ) -> Result<ReadDirResult, nfsstat3> {
         let state = self.state.lock().unwrap();
         let mut entries: Vec<DirEntry> = Vec::new();
 
@@ -812,7 +837,12 @@ mod tests {
         assert_eq!(attr.ftype as u32, ftype3::NF3DIR as u32);
 
         let listing = fs.readdir(title_ino, 0, 100).await.unwrap();
-        assert!(listing.entries.iter().any(|e| e.fileid == sub_ino && e.name.0 == b"Sub"));
+        assert!(
+            listing
+                .entries
+                .iter()
+                .any(|e| e.fileid == sub_ino && e.name.0 == b"Sub")
+        );
 
         let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
         assert!(persisted.contains("Sub"), "persisted doc was: {persisted}");
@@ -830,7 +860,10 @@ mod tests {
     async fn remove_deletes_an_empty_heading() {
         let (fs, _dir, file_ino) = mounted("# A\n\n# B\n").await;
         fs.remove(file_ino, &name("A")).await.unwrap();
-        assert!(matches!(fs.lookup(file_ino, &name("A")).await, Err(nfsstat3::NFS3ERR_NOENT)));
+        assert!(matches!(
+            fs.lookup(file_ino, &name("A")).await,
+            Err(nfsstat3::NFS3ERR_NOENT)
+        ));
         assert!(fs.lookup(file_ino, &name("B")).await.is_ok());
     }
 
@@ -839,7 +872,10 @@ mod tests {
         let (fs, dir, file_ino) = mounted("# Old\n\nbody\n").await;
         fs.rename(file_ino, &name("Old"), file_ino, &name("New")).await.unwrap();
 
-        assert!(matches!(fs.lookup(file_ino, &name("Old")).await, Err(nfsstat3::NFS3ERR_NOENT)));
+        assert!(matches!(
+            fs.lookup(file_ino, &name("Old")).await,
+            Err(nfsstat3::NFS3ERR_NOENT)
+        ));
         assert!(fs.lookup(file_ino, &name("New")).await.is_ok());
         let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
         assert!(persisted.contains("New"));
@@ -861,7 +897,10 @@ mod tests {
         assert_eq!(bytes, b"saved via temp file\n");
 
         let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
-        assert!(persisted.contains("saved via temp file"), "persisted doc was: {persisted}");
+        assert!(
+            persisted.contains("saved via temp file"),
+            "persisted doc was: {persisted}"
+        );
     }
 
     #[tokio::test]
@@ -870,13 +909,22 @@ mod tests {
         let title_ino = fs.lookup(file_ino, &name("Title")).await.unwrap();
         let content_ino = fs.lookup(title_ino, &name(document::CONTENT_FILE)).await.unwrap();
 
-        assert!(matches!(fs.write(content_ino, 0, b"x").await, Err(nfsstat3::NFS3ERR_ROFS)));
+        assert!(matches!(
+            fs.write(content_ino, 0, b"x").await,
+            Err(nfsstat3::NFS3ERR_ROFS)
+        ));
         assert!(matches!(
             fs.create(title_ino, &name("x"), sattr3::default()).await,
             Err(nfsstat3::NFS3ERR_ROFS)
         ));
-        assert!(matches!(fs.mkdir(title_ino, &name("Sub")).await, Err(nfsstat3::NFS3ERR_ROFS)));
-        assert!(matches!(fs.remove(title_ino, &name("content.md")).await, Err(nfsstat3::NFS3ERR_ROFS)));
+        assert!(matches!(
+            fs.mkdir(title_ino, &name("Sub")).await,
+            Err(nfsstat3::NFS3ERR_ROFS)
+        ));
+        assert!(matches!(
+            fs.remove(title_ino, &name("content.md")).await,
+            Err(nfsstat3::NFS3ERR_ROFS)
+        ));
         assert!(matches!(
             fs.rename(file_ino, &name("Title"), file_ino, &name("Renamed")).await,
             Err(nfsstat3::NFS3ERR_ROFS)
@@ -908,15 +956,24 @@ mod tests {
     #[tokio::test]
     async fn create_exclusive_rejects_an_existing_canonical_name() {
         let (fs, _dir, file_ino) = mounted("# Title\n\nbody\n").await;
-        let err = fs.create_exclusive(file_ino, &name(document::CONTENT_FILE)).await.unwrap_err();
+        let err = fs
+            .create_exclusive(file_ino, &name(document::CONTENT_FILE))
+            .await
+            .unwrap_err();
         assert!(matches!(err, nfsstat3::NFS3ERR_EXIST));
     }
 
     #[tokio::test]
     async fn root_directory_rejects_structural_mutations() {
         let (fs, _dir, _file_ino) = mounted("# Title\n\nbody\n").await;
-        assert!(matches!(fs.mkdir(ROOT_INO, &name("x")).await, Err(nfsstat3::NFS3ERR_PERM)));
-        assert!(matches!(fs.remove(ROOT_INO, &name("x")).await, Err(nfsstat3::NFS3ERR_PERM)));
+        assert!(matches!(
+            fs.mkdir(ROOT_INO, &name("x")).await,
+            Err(nfsstat3::NFS3ERR_PERM)
+        ));
+        assert!(matches!(
+            fs.remove(ROOT_INO, &name("x")).await,
+            Err(nfsstat3::NFS3ERR_PERM)
+        ));
     }
 
     #[tokio::test]
