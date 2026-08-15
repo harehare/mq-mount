@@ -7,7 +7,7 @@
 > [!WARNING]
 > This project is under active development. Interfaces, behavior, and file layout may change without notice, and things may break.
 
-FUSE-mount one or more Markdown files as a virtual filesystem: each file gets a top-level directory named after it, headings become subdirectories, and each section's body becomes a `content.md` file. Browse and edit a document with `ls`, `cat`, `grep`, `mkdir`, `rm`, and any regular text editor — writes are parsed back into the original Markdown via [mq-markdown](https://github.com/harehare/mq).
+NFS-mount one or more Markdown files as a virtual filesystem: each file gets a top-level directory named after it, headings become subdirectories, and each section's body becomes a `content.md` file. Browse and edit a document with `ls`, `cat`, `grep`, `mkdir`, `rm`, and any regular text editor; writes are parsed back into the original Markdown via [mq-markdown](https://github.com/harehare/mq).
 
 Companion tool for [mq](https://github.com/harehare/mq), a jq-like CLI for Markdown.
 
@@ -27,7 +27,7 @@ front matter
 ---                       ->  /a/_frontmatter.yaml (or _frontmatter.toml)
 ```
 
-A section's `content.md` holds only its own body — text up to the *next* heading of any depth, not its subsections' content. Nesting comes from heading depth and document order, not from any indentation convention; a `#` typed inside a deeply-nested section's `content.md` becomes a new top-level directory *within that file* on save, not a nested one.
+A section's `content.md` holds only its own body: text up to the *next* heading of any depth, not its subsections' content. Nesting comes from heading depth and document order, not from any indentation convention; a `#` typed inside a deeply-nested section's `content.md` becomes a new top-level directory *within that file* on save, not a nested one.
 
 The top-level per-file directories are fixed at mount time, one per file passed on the command line: `mkdir`/`rmdir`/`rename` at that level (or moving `content.md` between two different mounted files) are not supported (`EPERM`/`ENOENT`/`EOPNOTSUPP`).
 
@@ -36,31 +36,19 @@ The top-level per-file directories are fixed at mount time, one per file passed 
 - Editing `content.md` and saving splices the new text back into the source file. Typing a new heading line into it creates a new subdirectory on the next `ls`.
 - `mkdir NAME` under a directory adds a new (empty) subheading. Fails with `EEXIST` if a sibling already has that name.
 - `rmdir` is POSIX-strict: it only removes an already-empty directory (no subdirectories, empty `content.md`). Plain `rm -r somedir` still deletes a whole section and everything nested inside it, since the shell already unlinks/rmdirs bottom-up.
-- Renaming a directory renames the heading's title. Moving a directory to a *different* parent (reparenting) is not supported (`EOPNOTSUPP`) in this version. The top-level, per-file directories can't be created, removed, or renamed either (`EPERM`/`ENOENT`) — the set of mounted files is fixed for the life of the mount.
+- Renaming a directory renames the heading's title. Moving a directory to a *different* parent (reparenting) is not supported (`EOPNOTSUPP`) in this version. The top-level, per-file directories can't be created, removed, or renamed either (`EPERM`/`ENOENT`); the set of mounted files is fixed for the life of the mount.
 - Editors that save via a temp-file-then-rename dance (common with vim's `backupcopy=auto`, VS Code, and other "atomic save" tools) are supported: renaming any file onto a canonical `content.md`/frontmatter path adopts its bytes as that section's new content.
 
 ## Known limitations
 
-- **Not byte-exact.** Every save re-renders the *whole* document through mq-markdown. Mounting a file and saving without any edits can still normalize whitespace, blank-line counts, list markers, and table padding — mq-markdown's renderer doesn't guarantee a byte-identical round trip. mq-mount skips the rewrite when the render is unchanged from what it last wrote, to avoid *spurious* rewrites, but a first save after mount may differ from the original bytes even with no logical edit.
+- **Not byte-exact.** Every save re-renders the *whole* document through mq-markdown. Mounting a file and saving without any edits can still normalize whitespace, blank-line counts, list markers, and table padding; mq-markdown's renderer doesn't guarantee a byte-identical round trip. mq-mount skips the rewrite when the render is unchanged from what it last wrote, to avoid *spurious* rewrites, but a first save after mount may differ from the original bytes even with no logical edit.
 - **No external change detection.** If the source file is edited by something else while mounted, that change is not detected or merged; whichever write lands last (through the mount, or externally) wins.
-- **Linux and macOS only**, no Windows. macOS needs [macFUSE](https://macfuse.github.io/) installed — see below.
+- **Linux and macOS only**, no Windows.
 - Cross-directory `mv` (reparenting a heading) is not implemented.
 
 ## Installation
 
-Requires either libfuse (Linux) or [macFUSE](https://macfuse.github.io/) (macOS) to be installed *before building* — `fuser`'s build script needs `fuse.pc` on `PKG_CONFIG_PATH` just to compile, not only to mount.
-
-```sh
-# Linux
-sudo apt-get install libfuse-dev   # or your distro's equivalent
-
-# macOS
-brew install macfuse
-# macFUSE installs a system extension; macOS will prompt you to approve it under
-# System Settings -> Privacy & Security, and may ask for a restart.
-```
-
-Then build from source:
+No system packages are required; mounting uses the OS's built-in NFS client.
 
 ```sh
 git clone https://github.com/harehare/mq-mount
@@ -68,7 +56,7 @@ cd mq-mount
 cargo build --release
 ```
 
-The `mount` feature (which pulls in `fuser`) is enabled by default. Building without it (`cargo build --no-default-features`) still compiles and tests the core section-tree logic, but produces a binary that refuses to run — useful for CI or contributing without macFUSE installed locally.
+The `mount` feature is enabled by default. Building without it (`cargo build --no-default-features`) still compiles and tests the core section-tree logic, but produces a binary that refuses to run.
 
 ## Usage
 
@@ -82,8 +70,8 @@ echo "more text" >> /tmp/doc-mount/README/Installation/content.md
 mkdir /tmp/doc-mount/README/"New Section"
 
 # Unmount (Ctrl-C in the mq-mount process also does this):
-umount /tmp/doc-mount        # macOS
-fusermount -u /tmp/doc-mount # Linux
+diskutil unmount /tmp/doc-mount # macOS
+umount /tmp/doc-mount           # Linux
 ```
 
 ### Options
@@ -106,10 +94,10 @@ Options:
 ## Development
 
 ```sh
-# Core logic tests (no macFUSE required)
+# Core logic tests
 cargo test --no-default-features
 
-# Full build (requires macFUSE/libfuse, see Installation)
+# Full build
 cargo build
 cargo clippy
 ```
