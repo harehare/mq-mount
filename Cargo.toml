@@ -1,0 +1,46 @@
+[package]
+authors = ["Takahiro Sato <harehare1110@gmail.com>"]
+categories = ["command-line-utilities", "filesystem", "text-processing"]
+description = "FUSE-mount a Markdown file as a virtual filesystem: headings become directories, section bodies become files"
+edition = "2024"
+homepage = "https://mqlang.org/"
+keywords = ["markdown", "fuse", "filesystem", "mq"]
+license = "MIT"
+name = "mq-mount"
+readme = "README.md"
+repository = "https://github.com/harehare/mq-mount"
+version = "0.1.0"
+
+[[bin]]
+name = "mq-mount"
+path = "src/main.rs"
+
+[features]
+default = ["mount"]
+# The actual FUSE binding. Split out because `fuser`'s build script requires
+# libfuse/macFUSE's pkg-config file to be present just to *compile*, not only
+# to run — gating it lets `document`/`inode`'s core logic build and test on a
+# machine without macFUSE installed (e.g. plain CI, or before a contributor
+# has set up macFUSE locally).
+mount = ["dep:fuser"]
+
+[dependencies]
+clap = {version = "4.6.1", features = ["derive"]}
+fuser = {version = "0.18", optional = true}
+libc = "0.2"
+miette = {version = "7.6.0", features = ["fancy"]}
+mq-markdown = "0.8.2"
+rustc-hash = "2.1.2"
+thiserror = "2.0.18"
+tracing = "0.1.44"
+tracing-subscriber = {version = "0.3.23", features = ["env-filter"]}
+
+[dev-dependencies]
+rstest = "0.26.1"
+tempfile = "3.27"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+strip = true
