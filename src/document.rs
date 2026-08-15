@@ -236,10 +236,16 @@ impl Document {
     /// Reparses `body` and splices it into a section's content range. Heading
     /// lines typed into `body` become new subdirectories on the next rebuild.
     pub fn replace_section_content(&mut self, range: Range<usize>, body: &str) -> Result<(), MutationError> {
-        let new_nodes = body
+        // Strip position: `body`'s line numbers restart at 0, and the
+        // renderer's line-delta spacing can saturate to 0 against a later
+        // node in the full document, gluing them together with no separator.
+        let mut new_nodes = body
             .parse::<Markdown>()
             .map_err(|e| MutationError::Parse(e.to_string()))?
             .nodes;
+        for node in &mut new_nodes {
+            node.set_position(None);
+        }
         self.markdown.nodes.splice(range, new_nodes);
         Ok(())
     }
@@ -400,5 +406,150 @@ mod tests {
             doc.render_range(new_section.own_content_range.clone()).trim(),
             "child body"
         );
+    }
+
+    #[test]
+    fn replace_section_content_does_not_glue_onto_the_next_heading() {
+        let mut doc = Document::parse("# Title\n\n## A\n\nold\n\n## B\n\nb body\n").unwrap();
+        let tree = doc.tree();
+        let a = tree.find(&["Title", "A"]).unwrap();
+        doc.replace_section_content(a.own_content_range.clone(), "new\n").unwrap();
+
+        let reparsed = Document::parse(&doc.render()).unwrap();
+        let tree = reparsed.tree();
+        let a = tree.find(&["Title", "A"]).expect("A survives re-parse");
+        assert_eq!(reparsed.render_range(a.own_content_range.clone()).trim(), "new");
+        assert!(tree.find(&["Title", "B"]).is_some(), "B survives re-parse");
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    #[derive(Debug, Clone)]
+    struct HeadingSpec {
+        name: String,
+        body: String,
+        children: Vec<HeadingSpec>,
+    }
+
+    const NAME_POOL: [&str; 6] = ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot"];
+
+    fn heading_tree(max_depth: u32) -> impl Strategy<Value = Vec<HeadingSpec>> {
+        let leaf = (
+            proptest::sample::subsequence(NAME_POOL.to_vec(), 0..=4),
+            proptest::collection::vec("[a-zA-Z]{1,8}", 0..3),
+        )
+            .prop_map(|(names, words)| {
+                names
+                    .into_iter()
+                    .map(|name| HeadingSpec {
+                        name: name.to_string(),
+                        body: words.join(" "),
+                        children: Vec::new(),
+                    })
+                    .collect::<Vec<_>>()
+            });
+
+        leaf.prop_recursive(max_depth, 20, 4, |inner| {
+            (
+                proptest::sample::subsequence(NAME_POOL.to_vec(), 0..=4),
+                proptest::collection::vec("[a-zA-Z]{1,8}", 0..3),
+                proptest::collection::vec(inner, 0..3),
+            )
+                .prop_map(|(names, words, mut child_groups)| {
+                    names
+                        .into_iter()
+                        .map(|name| HeadingSpec {
+                            name: name.to_string(),
+                            body: words.join(" "),
+                            children: child_groups.pop().unwrap_or_default(),
+                        })
+                        .collect::<Vec<_>>()
+                })
+        })
+    }
+
+    fn render_specs(specs: &[HeadingSpec], depth: usize, out: &mut String) {
+        for spec in specs {
+            out.push_str(&"#".repeat(depth));
+            out.push(' ');
+            out.push_str(&spec.name);
+            out.push_str("\n\n");
+            if !spec.body.is_empty() {
+                out.push_str(&spec.body);
+                out.push_str("\n\n");
+            }
+            render_specs(&spec.children, depth + 1, out);
+        }
+    }
+
+    fn assert_matches_spec(specs: &[HeadingSpec], sections: &[Section]) {
+        assert_eq!(
+            specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            sections.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+        );
+        for (spec, section) in specs.iter().zip(sections) {
+            assert_matches_spec(&spec.children, &section.children);
+        }
+    }
+
+    /// Every path (in document order) to a heading in `specs`, as the name
+    /// chain `find` expects.
+    fn all_paths(specs: &[HeadingSpec], prefix: &[String], out: &mut Vec<Vec<String>>) {
+        for spec in specs {
+            let path: Vec<String> = prefix.iter().cloned().chain([spec.name.clone()]).collect();
+            out.push(path.clone());
+            all_paths(&spec.children, &path, out);
+        }
+    }
+
+    proptest! {
+        /// Regression coverage for the position-based line-delta bug: no
+        /// combination of heading nesting/order should render into something
+        /// that fails to reparse back into the same structure.
+        #[test]
+        fn heading_structure_round_trips_through_render_and_reparse(specs in heading_tree(3)) {
+            let mut src = String::new();
+            render_specs(&specs, 1, &mut src);
+            prop_assume!(!src.trim().is_empty());
+
+            let doc = Document::parse(&src).unwrap();
+            assert_matches_spec(&specs, &doc.tree().root.children);
+
+            let reparsed = Document::parse(&doc.render()).unwrap();
+            assert_matches_spec(&specs, &reparsed.tree().root.children);
+        }
+
+        /// `replace_section_content` on an arbitrary section, with an
+        /// arbitrary plain-text body, must never disturb sibling/ancestor
+        /// heading structure or fail to reparse.
+        #[test]
+        fn replace_section_content_preserves_sibling_headings(
+            specs in heading_tree(3),
+            path_index in any::<proptest::sample::Index>(),
+            new_body in "[a-zA-Z]{1,8}( [a-zA-Z]{1,8}){0,3}",
+        ) {
+            let mut paths = Vec::new();
+            all_paths(&specs, &[], &mut paths);
+            prop_assume!(!paths.is_empty());
+            let path = &paths[path_index.index(paths.len())];
+
+            let mut src = String::new();
+            render_specs(&specs, 1, &mut src);
+            let mut doc = Document::parse(&src).unwrap();
+
+            let refs: Vec<&str> = path.iter().map(String::as_str).collect();
+            let range = doc.tree().find(&refs).unwrap().own_content_range.clone();
+            doc.replace_section_content(range, &format!("{new_body}\n")).unwrap();
+
+            let reparsed = Document::parse(&doc.render()).unwrap();
+            assert_matches_spec(&specs, &reparsed.tree().root.children);
+            let section = reparsed.tree().find(&refs).unwrap().clone();
+            assert_eq!(reparsed.render_range(section.own_content_range).trim(), new_body.trim());
+        }
     }
 }
