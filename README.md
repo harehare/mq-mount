@@ -7,7 +7,7 @@
 > [!WARNING]
 > This project is under active development. Interfaces, behavior, and file layout may change without notice, and things may break.
 
-NFS-mount one or more Markdown files as a virtual filesystem: each file gets a top-level directory named after it, headings become subdirectories, and each section's body becomes a `content.md` file. Browse and edit a document with `ls`, `cat`, `grep`, `mkdir`, `rm`, and any regular text editor; writes are parsed back into the original Markdown via [mq-markdown](https://github.com/harehare/mq).
+Mount one or more Markdown files (or directories of them) as a virtual filesystem: each file gets a top-level directory named after it, headings become subdirectories, and each section's body becomes a `content.md` file. Browse and edit a document with `ls`, `cat`, `grep`, `mkdir`, `rm`, and any regular text editor; writes are parsed back into the original Markdown via [mq-markdown](https://github.com/harehare/mq). Mounting uses the OS's built-in NFS client on macOS/Linux, and [WinFSP](https://winfsp.dev) on Windows (see [Installation](#installation)).
 
 Companion tool for [mq](https://github.com/harehare/mq), a jq-like CLI for Markdown.
 
@@ -17,6 +17,11 @@ Companion tool for [mq](https://github.com/harehare/mq), a jq-like CLI for Markd
 a.md, b.md               ->  /a/...  and  /b/...   (one top-level dir per mounted file,
                                                       named after the file with its extension
                                                       stripped; duplicate stems get -2, -3, ...)
+
+docs/ (a directory        ->  /docs/guide/a/...  and  /docs/api/b/...
+  guide/a.md,                 (a directory argument mirrors its own layout under its own
+  api/b.md)                    name: every .md file found under it, recursively, skipping
+                                dotfiles/dot-directories such as .git)
 
 # Title (inside a.md)     ->  /a/content.md          (a.md's own preamble, if any)
                               /a/Title/content.md    (Title's own body)
@@ -29,7 +34,7 @@ front matter
 
 A section's `content.md` holds only its own body: text up to the *next* heading of any depth, not its subsections' content. Nesting comes from heading depth and document order, not from any indentation convention; a `#` typed inside a deeply-nested section's `content.md` becomes a new top-level directory *within that file* on save, not a nested one.
 
-The top-level per-file directories are fixed at mount time, one per file passed on the command line: `mkdir`/`rmdir`/`rename` at that level (or moving `content.md` between two different mounted files) are not supported (`EPERM`/`ENOENT`/`EOPNOTSUPP`).
+The directories mirroring the command-line arguments (the top-level per-file directories, and any intermediate directories contributed by a directory argument) are fixed at mount time: `mkdir`/`rmdir`/`rename` at that level (or moving `content.md` between two different mounted files) are not supported (`EPERM`/`ENOENT`/`EOPNOTSUPP`).
 
 ## Read/write semantics
 
@@ -48,13 +53,15 @@ The top-level per-file directories are fixed at mount time, one per file passed 
 ## Known limitations
 
 - **Not byte-exact.** Every save re-renders the *whole* document through mq-markdown. Mounting a file and saving without any edits can still normalize whitespace, blank-line counts, list markers, and table padding; mq-markdown's renderer doesn't guarantee a byte-identical round trip. mq-mount skips the rewrite when the render is unchanged from what it last wrote, to avoid *spurious* rewrites, but a first save after mount may differ from the original bytes even with no logical edit.
-- **No external change detection.** If the source file is edited by something else while mounted, that change is not detected or merged; whichever write lands last (through the mount, or externally) wins.
-- **Linux and macOS only**, no Windows.
+- **External changes are detected but not merged.** If a source file's mtime advances outside the mount while mounted, the next write-through logs a warning before it overwrites — but it still overwrites; there's no diff/merge, so the external edit is lost. Whichever write lands last (through the mount, or externally) wins.
 - Cross-directory `mv` (reparenting a heading) is not implemented.
+- **The Windows (WinFSP) backend is unverified.** It's written against WinFSP's documented API and an example filesystem from its own repository, but hasn't yet been built or run on an actual Windows machine — see [Installation](#installation).
 
 ## Installation
 
-No system packages are required; mounting uses the OS's built-in NFS client.
+**macOS/Linux**: no system packages are required; mounting uses the OS's built-in NFS client.
+
+**Windows**: install [WinFSP](https://winfsp.dev) first (a separate driver, like macFUSE on macOS — there's no lighter-weight option, since Windows' own built-in NFS client is gated to Pro/Enterprise/Server editions and doesn't support the custom ports this tool needs). This backend hasn't been verified on a real Windows machine yet; see [Known limitations](#known-limitations).
 
 ```sh
 git clone https://github.com/harehare/mq-mount
@@ -69,6 +76,8 @@ The `mount` feature is enabled by default. Building without it (`cargo build --n
 ```sh
 mkdir /tmp/doc-mount
 mq-mount README.md CHANGELOG.md /tmp/doc-mount
+# or mount every .md file under a directory tree, structure mirrored:
+mq-mount docs/ /tmp/doc-mount
 
 ls /tmp/doc-mount
 cat /tmp/doc-mount/README/Installation/content.md
@@ -78,23 +87,31 @@ mkdir /tmp/doc-mount/README/"New Section"
 # Unmount (Ctrl-C in the mq-mount process also does this):
 diskutil unmount /tmp/doc-mount # macOS
 umount /tmp/doc-mount           # Linux
+# Windows: Ctrl-C in the mq-mount process; WinFSP unmounts automatically.
 ```
 
 ### Options
 
 ```
-Usage: mq-mount [OPTIONS] <PATHS>...
+Usage: mq-mount [OPTIONS] <PATHS> <PATHS>...
 
 Arguments:
-  <PATHS>...  Markdown files to mount, followed by the mount directory as the
-              last argument (e.g. `a.md b.md /mnt`)
+  <PATHS> <PATHS>...  Markdown files and/or directories to mount, followed by
+                      the mount directory as the last argument (e.g. `a.md
+                      docs/ /mnt`). A directory contributes every `.md` file
+                      found under it (recursively, skipping dotfiles/dot-
+                      directories), mirroring its own layout under the
+                      directory's own name in the mount
 
 Options:
-      --readonly      Mount read-only; all writes are rejected
-      --allow-other    Allow other users on the machine to access the mount
-  -v, --verbose        Enable verbose (debug) logging
-  -h, --help           Print help
-  -V, --version        Print version
+      --readonly     Mount read-only; all writes are rejected
+      --allow-other  Loosen file permission bits so other local users can
+                     read/write the mount (the underlying NFS server has no
+                     per-caller ACL to restrict access to the mounting user;
+                     no effect on Windows)
+  -v, --verbose      Enable verbose (debug) logging
+  -h, --help         Print help
+  -V, --version      Print version
 ```
 
 ## Development

@@ -17,22 +17,38 @@ path = "src/main.rs"
 
 [features]
 default = ["mount"]
-# The NFSv3-server-backed mount. Split out so `document`/`inode`'s core logic
-# builds and tests without pulling in the server/runtime dependencies.
-mount = ["dep:nfsserve", "dep:tokio", "dep:async-trait"]
+# The per-OS mount backend (NFSv3 on Unix, WinFSP on Windows). Split out so
+# `document`/`fs`/`inode`/`vfs`'s core logic builds and tests without pulling
+# in the server/runtime dependencies.
+mount = ["dep:nfsserve", "dep:tokio", "dep:async-trait", "dep:winfsp", "dep:windows", "dep:widestring"]
 
 [dependencies]
-async-trait = { version = "0.1.92", optional = true }
 clap = {version = "4.6.1", features = ["derive"]}
 libc = "0.2"
 miette = {version = "7.6.0", features = ["fancy"]}
 mq-markdown = "0.8.2"
-nfsserve = { version = "0.11.0", optional = true }
 rustc-hash = "2.1.2"
 thiserror = "2.0.18"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "signal"], optional = true }
 tracing = "0.1.44"
 tracing-subscriber = {version = "0.3.23", features = ["env-filter"]}
+
+[target.'cfg(unix)'.dependencies]
+async-trait = { version = "0.1.92", optional = true }
+nfsserve = { version = "0.11.0", optional = true }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "signal"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# Windows has no lightweight user-space NFS path (the built-in NFS client is
+# gated to Pro/Enterprise/Server editions and doesn't take custom ports), so
+# WinFSP is the mount backend here. Unlike the NFS path, this does require a
+# separately installed driver (https://winfsp.dev) — unverified in this repo's
+# CI beyond compiling, see README.
+winfsp = { version = "0.13", optional = true, features = ["system"] }
+windows = { version = "0.62", optional = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem"] }
+widestring = { version = "1", optional = true }
+
+[target.'cfg(windows)'.build-dependencies]
+winfsp = { version = "0.13", features = ["delayload"] }
 
 [dev-dependencies]
 proptest = "1.11.0"
