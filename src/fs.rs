@@ -134,6 +134,11 @@ impl MountState {
         Ok(())
     }
 
+    fn rebuild_and_persist(&mut self, file_idx: usize) -> Result<(), nfsstat3> {
+        self.rebuild(file_idx);
+        self.persist(file_idx).map_err(|_| nfsstat3::NFS3ERR_IO)
+    }
+
     fn alloc_ino(&mut self) -> u64 {
         let ino = self.next_ino;
         self.next_ino += 1;
@@ -195,9 +200,7 @@ impl MountState {
             .document
             .replace_section_content(range, text)
             .map_err(map_mutation_error)?;
-        self.rebuild(file_idx);
-        self.persist(file_idx).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-        Ok(())
+        self.rebuild_and_persist(file_idx)
     }
 
     fn commit_frontmatter(&mut self, file_idx: usize, kind: FrontMatterKind, text: &str) -> Result<(), nfsstat3> {
@@ -205,14 +208,54 @@ impl MountState {
             && found_kind == kind
         {
             self.files[file_idx].document.set_frontmatter(idx, text.to_string());
-            self.rebuild(file_idx);
-            self.persist(file_idx).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            self.rebuild_and_persist(file_idx)?;
         }
         Ok(())
     }
 
+    fn canonical_child(parent_path: &[String], name: &str) -> Option<MountPath> {
+        if name == document::CONTENT_FILE {
+            Some(MountPath::Content(parent_path.to_vec()))
+        } else if parent_path.is_empty() {
+            frontmatter_kind_for_name(name).map(MountPath::FrontMatter)
+        } else {
+            None
+        }
+    }
+
+    fn has_heading_child(&self, file_idx: usize, parent_path: &[String], name: &str) -> bool {
+        self.find_section(file_idx, parent_path)
+            .is_some_and(|s| s.children.iter().any(|c| c.name == name))
+    }
+
+    fn alloc_scratch(&mut self, key: (u64, String)) -> u64 {
+        let ino = self.alloc_ino();
+        self.scratch.insert(ino, Vec::new());
+        self.scratch_by_name.insert(key, ino);
+        ino
+    }
+
+    fn bytes_for(&self, file_idx: usize, path: &MountPath) -> Result<Vec<u8>, nfsstat3> {
+        match path {
+            MountPath::Content(p) => Ok(self.section_bytes(file_idx, p)),
+            MountPath::FrontMatter(kind) => Ok(self.frontmatter_bytes(file_idx, *kind)),
+            MountPath::Dir(_) => Err(nfsstat3::NFS3ERR_ISDIR),
+        }
+    }
+
+    fn commit(&mut self, file_idx: usize, path: &MountPath, text: &str) -> Result<(), nfsstat3> {
+        match path {
+            MountPath::Content(p) => self.commit_content(file_idx, p, text),
+            MountPath::FrontMatter(kind) => self.commit_frontmatter(file_idx, *kind, text),
+            MountPath::Dir(_) => Err(nfsstat3::NFS3ERR_ISDIR),
+        }
+    }
+
     fn attr(&self, ino: u64, kind: ftype3, size: u64) -> fattr3 {
-        let now = nfs_now();
+        self.attr_at(ino, kind, size, nfs_now())
+    }
+
+    fn attr_at(&self, ino: u64, kind: ftype3, size: u64, now: nfstime3) -> fattr3 {
         let mode = match kind {
             ftype3::NF3DIR if self.allow_other => 0o777,
             ftype3::NF3DIR => 0o755,
@@ -267,6 +310,12 @@ fn map_mutation_error(e: MutationError) -> nfsstat3 {
     }
 }
 
+/// What a `rename()` destination name canonically resolves to.
+enum RenameDest {
+    Content,
+    FrontMatter(FrontMatterKind),
+}
+
 fn frontmatter_kind_for_name(name: &str) -> Option<FrontMatterKind> {
     [FrontMatterKind::Yaml, FrontMatterKind::Toml]
         .into_iter()
@@ -275,6 +324,10 @@ fn frontmatter_kind_for_name(name: &str) -> Option<FrontMatterKind> {
 
 fn name_str(name: &filename3) -> Result<&str, nfsstat3> {
     std::str::from_utf8(name.as_ref()).map_err(|_| nfsstat3::NFS3ERR_INVAL)
+}
+
+fn to_text_lossy(buf: Vec<u8>) -> String {
+    String::from_utf8(buf).unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned())
 }
 
 fn splice(buf: &mut Vec<u8>, offset: usize, data: &[u8]) {
@@ -358,16 +411,9 @@ impl NFSFileSystem for MqFs {
         }
 
         let (file_idx, parent_path) = state.dir_path(dirid).ok_or(nfsstat3::NFS3ERR_NOTDIR)?;
-        let child_path = if name == document::CONTENT_FILE {
-            MountPath::Content(parent_path)
-        } else if parent_path.is_empty()
-            && let Some(kind) = frontmatter_kind_for_name(name)
-        {
-            MountPath::FrontMatter(kind)
-        } else if state
-            .find_section(file_idx, &parent_path)
-            .is_some_and(|s| s.children.iter().any(|c| c.name == name))
-        {
+        let child_path = if let Some(mp) = MountState::canonical_child(&parent_path, name) {
+            mp
+        } else if state.has_heading_child(file_idx, &parent_path, name) {
             let mut p = parent_path;
             p.push(name.to_string());
             MountPath::Dir(p)
@@ -410,11 +456,7 @@ impl NFSFileSystem for MqFs {
             if let Some(buf) = state.scratch.get_mut(&id) {
                 buf.clear();
             } else if let Some((file_idx, path)) = state.path_for_ino(id) {
-                match &path {
-                    MountPath::Content(p) => state.commit_content(file_idx, p, "")?,
-                    MountPath::FrontMatter(kind) => state.commit_frontmatter(file_idx, *kind, "")?,
-                    MountPath::Dir(_) => return Err(nfsstat3::NFS3ERR_ISDIR),
-                }
+                state.commit(file_idx, &path, "")?;
             }
         }
         if let Some(buf) = state.scratch.get(&id) {
@@ -429,13 +471,11 @@ impl NFSFileSystem for MqFs {
 
     async fn read(&self, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3> {
         let state = self.state.lock().unwrap();
-        let bytes = if let Some(buf) = state.scratch.get(&id) {
-            buf.clone()
+        let bytes: std::borrow::Cow<[u8]> = if let Some(buf) = state.scratch.get(&id) {
+            std::borrow::Cow::Borrowed(buf)
         } else {
             match state.path_for_ino(id) {
-                Some((file_idx, MountPath::Content(p))) => state.section_bytes(file_idx, &p),
-                Some((file_idx, MountPath::FrontMatter(kind))) => state.frontmatter_bytes(file_idx, kind),
-                Some((_, MountPath::Dir(_))) => return Err(nfsstat3::NFS3ERR_ISDIR),
+                Some((file_idx, path)) => std::borrow::Cow::Owned(state.bytes_for(file_idx, &path)?),
                 None => {
                     tracing::debug!("read({id}): no path for this fileid");
                     return Err(nfsstat3::NFS3ERR_NOENT);
@@ -468,21 +508,9 @@ impl NFSFileSystem for MqFs {
         }
 
         let (file_idx, path) = state.path_for_ino(id).ok_or(nfsstat3::NFS3ERR_NOENT)?;
-        match &path {
-            MountPath::Content(p) => {
-                let mut buf = state.section_bytes(file_idx, p);
-                splice(&mut buf, offset, data);
-                let text = String::from_utf8_lossy(&buf).into_owned();
-                state.commit_content(file_idx, p, &text)?;
-            }
-            MountPath::FrontMatter(kind) => {
-                let mut buf = state.frontmatter_bytes(file_idx, *kind);
-                splice(&mut buf, offset, data);
-                let text = String::from_utf8_lossy(&buf).into_owned();
-                state.commit_frontmatter(file_idx, *kind, &text)?;
-            }
-            MountPath::Dir(_) => return Err(nfsstat3::NFS3ERR_ISDIR),
-        }
+        let mut buf = state.bytes_for(file_idx, &path)?;
+        splice(&mut buf, offset, data);
+        state.commit(file_idx, &path, &to_text_lossy(buf))?;
         Ok(state.attr_for(file_idx, id, &path))
     }
 
@@ -494,16 +522,7 @@ impl NFSFileSystem for MqFs {
         let name = name_str(filename)?;
         let (file_idx, parent_path) = state.dir_path(dirid).ok_or(nfsstat3::NFS3ERR_NOENT)?;
 
-        let canonical = if name == document::CONTENT_FILE {
-            Some(MountPath::Content(parent_path))
-        } else if parent_path.is_empty()
-            && let Some(kind) = frontmatter_kind_for_name(name)
-        {
-            Some(MountPath::FrontMatter(kind))
-        } else {
-            None
-        };
-        if let Some(mp) = canonical {
+        if let Some(mp) = MountState::canonical_child(&parent_path, name) {
             let ino = state.files[file_idx].inodes.ino_for(&mp).ok_or(nfsstat3::NFS3ERR_IO)?;
             return Ok((ino, state.attr_for(file_idx, ino, &mp)));
         }
@@ -513,9 +532,7 @@ impl NFSFileSystem for MqFs {
             let len = state.scratch.get(&ino).map(Vec::len).unwrap_or(0) as u64;
             return Ok((ino, state.attr(ino, ftype3::NF3REG, len)));
         }
-        let ino = state.alloc_ino();
-        state.scratch.insert(ino, Vec::new());
-        state.scratch_by_name.insert(key, ino);
+        let ino = state.alloc_scratch(key);
         Ok((ino, state.attr(ino, ftype3::NF3REG, 0)))
     }
 
@@ -530,21 +547,15 @@ impl NFSFileSystem for MqFs {
             state.root_children.iter().any(|(slug, _)| slug == name)
         } else {
             let (file_idx, parent_path) = state.dir_path(dirid).ok_or(nfsstat3::NFS3ERR_NOENT)?;
-            name == document::CONTENT_FILE
-                || (parent_path.is_empty() && frontmatter_kind_for_name(name).is_some())
-                || state
-                    .find_section(file_idx, &parent_path)
-                    .is_some_and(|s| s.children.iter().any(|c| c.name == name))
+            MountState::canonical_child(&parent_path, name).is_some()
+                || state.has_heading_child(file_idx, &parent_path, name)
                 || state.scratch_by_name.contains_key(&(dirid, name.to_string()))
         };
         if exists {
             return Err(nfsstat3::NFS3ERR_EXIST);
         }
 
-        let ino = state.alloc_ino();
-        state.scratch.insert(ino, Vec::new());
-        state.scratch_by_name.insert((dirid, name.to_string()), ino);
-        Ok(ino)
+        Ok(state.alloc_scratch((dirid, name.to_string())))
     }
 
     async fn mkdir(&self, dirid: fileid3, dirname: &filename3) -> Result<(fileid3, fattr3), nfsstat3> {
@@ -565,8 +576,7 @@ impl NFSFileSystem for MqFs {
             .document
             .insert_heading(&parent_section, name)
             .map_err(map_mutation_error)?;
-        state.rebuild(file_idx);
-        state.persist(file_idx).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        state.rebuild_and_persist(file_idx)?;
 
         let mut child_path = parent_path;
         child_path.push(name.to_string());
@@ -607,8 +617,7 @@ impl NFSFileSystem for MqFs {
             .document
             .remove_heading(&section)
             .map_err(map_mutation_error)?;
-        state.rebuild(file_idx);
-        state.persist(file_idx).map_err(|_| nfsstat3::NFS3ERR_IO)
+        state.rebuild_and_persist(file_idx)
     }
 
     async fn rename(
@@ -627,15 +636,13 @@ impl NFSFileSystem for MqFs {
 
         let (dest_file_idx, new_parent_path) = state.dir_path(to_dirid).ok_or(nfsstat3::NFS3ERR_NOENT)?;
 
-        let dest_kind = if newname == document::CONTENT_FILE {
-            Some(None)
-        } else if new_parent_path.is_empty() {
-            frontmatter_kind_for_name(newname).map(Some)
-        } else {
-            None
+        let dest_kind = match MountState::canonical_child(&new_parent_path, newname) {
+            Some(MountPath::Content(_)) => Some(RenameDest::Content),
+            Some(MountPath::FrontMatter(kind)) => Some(RenameDest::FrontMatter(kind)),
+            _ => None,
         };
 
-        if let Some(front_matter_kind) = dest_kind {
+        if let Some(dest_kind) = dest_kind {
             let key = (from_dirid, name.to_string());
             let (bytes, clear_source_path) = if let Some(ino) = state.scratch_by_name.get(&key).copied() {
                 (state.scratch.get(&ino).cloned(), None)
@@ -655,11 +662,11 @@ impl NFSFileSystem for MqFs {
             };
 
             let bytes = bytes.ok_or(nfsstat3::NFS3ERR_NOENT)?;
-            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let text = to_text_lossy(bytes);
 
-            match front_matter_kind {
-                None => state.commit_content(dest_file_idx, &new_parent_path, &text)?,
-                Some(kind) => state.commit_frontmatter(dest_file_idx, kind, &text)?,
+            match dest_kind {
+                RenameDest::Content => state.commit_content(dest_file_idx, &new_parent_path, &text)?,
+                RenameDest::FrontMatter(kind) => state.commit_frontmatter(dest_file_idx, kind, &text)?,
             }
             if let Some(p) = clear_source_path {
                 state.commit_content(dest_file_idx, &p, "")?;
@@ -687,8 +694,7 @@ impl NFSFileSystem for MqFs {
             .document
             .rename_heading(&section, newname)
             .map_err(map_mutation_error)?;
-        state.rebuild(file_idx);
-        state.persist(file_idx).map_err(|_| nfsstat3::NFS3ERR_IO)
+        state.rebuild_and_persist(file_idx)
     }
 
     async fn readdir(
@@ -699,13 +705,14 @@ impl NFSFileSystem for MqFs {
     ) -> Result<ReadDirResult, nfsstat3> {
         let state = self.state.lock().unwrap();
         let mut entries: Vec<DirEntry> = Vec::new();
+        let now = nfs_now();
 
         if dirid == ROOT_INO {
             for (slug, ino) in &state.root_children {
                 entries.push(DirEntry {
                     fileid: *ino,
                     name: filename3::from(slug.as_bytes()),
-                    attr: state.attr(*ino, ftype3::NF3DIR, 0),
+                    attr: state.attr_at(*ino, ftype3::NF3DIR, 0, now),
                 });
             }
             return Ok(paginate(entries, start_after, max_entries));
@@ -723,7 +730,7 @@ impl NFSFileSystem for MqFs {
         entries.push(DirEntry {
             fileid: content_ino,
             name: filename3::from(document::CONTENT_FILE.as_bytes()),
-            attr: state.attr(content_ino, ftype3::NF3REG, content_size),
+            attr: state.attr_at(content_ino, ftype3::NF3REG, content_size, now),
         });
 
         if path.is_empty()
@@ -734,7 +741,7 @@ impl NFSFileSystem for MqFs {
             entries.push(DirEntry {
                 fileid: fm_ino,
                 name: filename3::from(kind.file_name().as_bytes()),
-                attr: state.attr(fm_ino, ftype3::NF3REG, size),
+                attr: state.attr_at(fm_ino, ftype3::NF3REG, size, now),
             });
         }
 
@@ -745,7 +752,7 @@ impl NFSFileSystem for MqFs {
                 entries.push(DirEntry {
                     fileid: child_ino,
                     name: filename3::from(child.name.as_bytes()),
-                    attr: state.attr(child_ino, ftype3::NF3DIR, 0),
+                    attr: state.attr_at(child_ino, ftype3::NF3DIR, 0, now),
                 });
             }
         }

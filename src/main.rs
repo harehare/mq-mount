@@ -99,12 +99,17 @@ mod app {
         Ok(())
     }
 
-    #[cfg(target_os = "macos")]
-    fn mount_nfs(mountpoint: &Path, port: u16, readonly: bool) -> miette::Result<()> {
-        let mut opts = format!("noac,nolocks,vers=3,tcp,port={port},mountport={port}");
+    fn nfs_mount_opts(nolock_flag: &str, port: u16, readonly: bool) -> String {
+        let mut opts = format!("noac,{nolock_flag},vers=3,tcp,port={port},mountport={port}");
         if readonly {
             opts.push_str(",ro");
         }
+        opts
+    }
+
+    #[cfg(target_os = "macos")]
+    fn mount_nfs(mountpoint: &Path, port: u16, readonly: bool) -> miette::Result<()> {
+        let opts = nfs_mount_opts("nolocks", port, readonly);
         run_mount_command(Command::new("mount_nfs").args([
             "-o",
             &opts,
@@ -115,10 +120,7 @@ mod app {
 
     #[cfg(target_os = "linux")]
     fn mount_nfs(mountpoint: &Path, port: u16, readonly: bool) -> miette::Result<()> {
-        let mut opts = format!("noac,nolock,vers=3,tcp,port={port},mountport={port}");
-        if readonly {
-            opts.push_str(",ro");
-        }
+        let opts = nfs_mount_opts("nolock", port, readonly);
         run_mount_command(Command::new("mount").args([
             "-t",
             "nfs",
