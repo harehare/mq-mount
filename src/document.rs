@@ -5,7 +5,7 @@
 
 use std::ops::Range;
 
-use mq_markdown::{Heading, Markdown, Node, Text};
+use mq_markdown::{Heading, Markdown, Node, Point, Position, Text};
 use rustc_hash::FxHashMap;
 
 /// The canonical file name for a section's own body content.
@@ -47,6 +47,23 @@ impl Section {
     /// it walks bottom-up.
     pub fn is_removable(&self) -> bool {
         self.children.is_empty() && self.own_content_range.is_empty()
+    }
+
+    /// End of this section's entire subtree, vs. [`Section::own_content_range`] which stops at the first child heading.
+    fn subtree_end(&self) -> usize {
+        self.children
+            .last()
+            .map_or(self.own_content_range.end, Section::subtree_end)
+    }
+
+    /// The deepest heading depth in this section's subtree, including itself.
+    fn max_depth(&self) -> u8 {
+        self.children
+            .iter()
+            .map(Section::max_depth)
+            .max()
+            .unwrap_or(self.depth)
+            .max(self.depth)
     }
 }
 
@@ -186,6 +203,10 @@ pub enum MutationError {
     NotADirectory,
     #[error("failed to parse markdown: {0}")]
     Parse(String),
+    #[error("cannot move a heading into its own subtree")]
+    WouldCreateCycle,
+    #[error("heading would be nested deeper than level 6, which Markdown headings can't express")]
+    TooDeep,
 }
 
 /// Owns the flat, parsed node list. [`SectionTree`] is always a fresh view
@@ -236,17 +257,12 @@ impl Document {
     /// Reparses `body` and splices it into a section's content range. Heading
     /// lines typed into `body` become new subdirectories on the next rebuild.
     pub fn replace_section_content(&mut self, range: Range<usize>, body: &str) -> Result<(), MutationError> {
-        // Strip position: `body`'s line numbers restart at 0, and the
-        // renderer's line-delta spacing can saturate to 0 against a later
-        // node in the full document, gluing them together with no separator.
-        let mut new_nodes = body
+        let new_nodes = body
             .parse::<Markdown>()
             .map_err(|e| MutationError::Parse(e.to_string()))?
             .nodes;
-        for node in &mut new_nodes {
-            node.set_position(None);
-        }
         self.markdown.nodes.splice(range, new_nodes);
+        self.renumber_top_level_positions();
         Ok(())
     }
 
@@ -263,7 +279,23 @@ impl Document {
             position: None,
         });
         self.markdown.nodes.insert(parent.own_content_range.end, heading);
+        self.renumber_top_level_positions();
         Ok(())
+    }
+
+    /// Spaces every top-level node's own position 2 lines apart so the
+    /// renderer always puts exactly one blank line between them; a `None`
+    /// position (every spliced/inserted node) collapses that to no blank
+    /// line at all.
+    fn renumber_top_level_positions(&mut self) {
+        let mut line = 1usize;
+        for node in &mut self.markdown.nodes {
+            node.set_position(Some(Position {
+                start: Point { line, column: 1 },
+                end: Point { line, column: 1 },
+            }));
+            line += 2;
+        }
     }
 
     pub fn rename_heading(&mut self, section: &Section, new_name: &str) -> Result<(), MutationError> {
@@ -283,6 +315,54 @@ impl Document {
         }
         let idx = section.heading_index.ok_or(MutationError::NotADirectory)?;
         self.markdown.nodes.remove(idx);
+        self.renumber_top_level_positions();
+        Ok(())
+    }
+
+    /// Reparents `section` (and its subtree) under `new_parent`, renaming it to `new_name`. Both must be from the same, not-yet-mutated `tree()` snapshot.
+    pub fn move_heading(
+        &mut self,
+        section: &Section,
+        new_parent: &Section,
+        new_name: &str,
+    ) -> Result<(), MutationError> {
+        if new_parent.children.iter().any(|c| c.name == new_name) {
+            return Err(MutationError::AlreadyExists(new_name.to_string()));
+        }
+        let start = section.heading_index.ok_or(MutationError::NotADirectory)?;
+        let end = section.subtree_end();
+        if let Some(new_parent_idx) = new_parent.heading_index
+            && (start..end).contains(&new_parent_idx)
+        {
+            return Err(MutationError::WouldCreateCycle);
+        }
+
+        let depth_shift = new_parent.depth as i16 + 1 - section.depth as i16;
+        if section.max_depth() as i16 + depth_shift > 6 {
+            return Err(MutationError::TooDeep);
+        }
+
+        let mut moved: Vec<Node> = self.markdown.nodes.drain(start..end).collect();
+        for node in &mut moved {
+            if let Node::Heading(h) = node {
+                h.depth = (h.depth as i16 + depth_shift) as u8;
+            }
+        }
+        if let Some(Node::Heading(h)) = moved.first_mut() {
+            h.values = vec![Node::Text(Text {
+                value: new_name.to_string(),
+                position: None,
+            })];
+        }
+
+        let removed_len = end - start;
+        let insert_at = if new_parent.own_content_range.end <= start {
+            new_parent.own_content_range.end
+        } else {
+            new_parent.own_content_range.end - removed_len
+        };
+        self.markdown.nodes.splice(insert_at..insert_at, moved);
+        self.renumber_top_level_positions();
         Ok(())
     }
 }
@@ -291,6 +371,38 @@ impl Document {
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    #[test]
+    fn replace_section_content_preserves_the_blank_line_after_the_heading() {
+        let mut doc = Document::parse("# Title\n\nline1\nline2\n").unwrap();
+        let tree = doc.tree();
+        let title = tree.find(&["Title"]).unwrap();
+        let mut body = doc.render_range(title.own_content_range.clone());
+        body.push_str("line3\n");
+        doc.replace_section_content(title.own_content_range.clone(), &body)
+            .unwrap();
+        assert_eq!(doc.render(), "# Title\n\nline1\nline2\nline3\n");
+    }
+
+    #[test]
+    fn replace_section_content_preserves_blank_lines_between_paragraphs() {
+        let mut doc = Document::parse("# Title\n\npara one\n\npara two\n\npara three\n").unwrap();
+        let tree = doc.tree();
+        let title = tree.find(&["Title"]).unwrap();
+        let body = doc.render_range(title.own_content_range.clone());
+        doc.replace_section_content(title.own_content_range.clone(), &body)
+            .unwrap();
+        assert_eq!(doc.render(), "# Title\n\npara one\n\npara two\n\npara three\n");
+    }
+
+    #[test]
+    fn insert_heading_preserves_blank_lines_around_the_new_heading() {
+        let mut doc = Document::parse("# Title\n\nintro\n\n## A\n\na body\n").unwrap();
+        let tree = doc.tree();
+        let title = tree.find(&["Title"]).unwrap();
+        doc.insert_heading(title, "New").unwrap();
+        assert_eq!(doc.render(), "# Title\n\nintro\n\n## New\n\n## A\n\na body\n");
+    }
 
     fn names(sections: &[Section]) -> Vec<&str> {
         sections.iter().map(|s| s.name.as_str()).collect()
@@ -370,6 +482,65 @@ mod tests {
         assert!(tree.find(&["Title", "Renamed"]).is_none());
         assert!(doc.render().contains("# Title"));
         assert!(!doc.render().contains("Renamed"));
+    }
+
+    #[test]
+    fn move_heading_reparents_a_section_and_its_subtree() {
+        let mut doc = Document::parse("# A\n\nintro\n\n## B\n\nb\n\n### C\n\nc\n\n# D\n\nd\n\n## E\n\ne\n").unwrap();
+        let tree = doc.tree();
+        let b = tree.find(&["A", "B"]).unwrap();
+        let e = tree.find(&["D", "E"]).unwrap();
+        doc.move_heading(b, e, "Moved").unwrap();
+
+        let tree = doc.tree();
+        assert!(tree.find(&["A", "B"]).is_none(), "B no longer under A");
+        assert!(tree.find(&["A"]).unwrap().children.is_empty(), "A has no children left");
+
+        let moved = tree.find(&["D", "E", "Moved"]).expect("B now lives under D/E as Moved");
+        assert_eq!(doc.render_range(moved.own_content_range.clone()).trim(), "b");
+        let child = tree
+            .find(&["D", "E", "Moved", "C"])
+            .expect("C moved along with its parent");
+        assert_eq!(doc.render_range(child.own_content_range.clone()).trim(), "c");
+
+        // Depths must stay valid ATX headings (round-trips through render+reparse).
+        let reparsed = Document::parse(&doc.render()).unwrap();
+        assert!(reparsed.tree().find(&["D", "E", "Moved", "C"]).is_some());
+    }
+
+    #[test]
+    fn move_heading_rejects_duplicate_name_at_destination() {
+        let mut doc = Document::parse("# A\n\n## X\n\nax\n\n# B\n\n## X\n\nbx\n").unwrap();
+        let tree = doc.tree();
+        let a_x = tree.find(&["A", "X"]).unwrap();
+        let b = tree.find(&["B"]).unwrap();
+        let err = doc.move_heading(a_x, b, "X").unwrap_err();
+        assert!(matches!(err, MutationError::AlreadyExists(_)));
+    }
+
+    #[test]
+    fn move_heading_rejects_moving_into_its_own_subtree() {
+        let mut doc = Document::parse("# A\n\n## B\n\nb\n").unwrap();
+        let tree = doc.tree();
+        let a = tree.find(&["A"]).unwrap();
+        let b = tree.find(&["A", "B"]).unwrap();
+        let err = doc.move_heading(a, b, "A").unwrap_err();
+        assert!(matches!(err, MutationError::WouldCreateCycle));
+    }
+
+    #[test]
+    fn move_heading_rejects_when_it_would_exceed_heading_depth_6() {
+        let mut doc = Document::parse(
+            "# 1\n\n## 2\n\n### 3\n\n#### 4\n\n##### 5\n\n###### 6\n\nleaf\n\n\
+             # Other\n\n## OA\n\n### OB\n\n#### OC\n\n##### OD\n\n###### OE\n\noe leaf\n",
+        )
+        .unwrap();
+        let tree = doc.tree();
+        // "2" carries its depth-6 leaf; under depth-6 "OE" that needs depth 7+.
+        let two = tree.find(&["1", "2"]).unwrap();
+        let oe = tree.find(&["Other", "OA", "OB", "OC", "OD", "OE"]).unwrap();
+        let err = doc.move_heading(two, oe, "Moved").unwrap_err();
+        assert!(matches!(err, MutationError::TooDeep));
     }
 
     #[test]
@@ -551,6 +722,34 @@ mod proptests {
             assert_matches_spec(&specs, &reparsed.tree().root.children);
             let section = reparsed.tree().find(&refs).unwrap().clone();
             assert_eq!(reparsed.render_range(section.own_content_range).trim(), new_body.trim());
+        }
+
+        /// Writing a section's own unmodified body back into itself (as every
+        /// save does, edited or not) must not disturb the full-document
+        /// render beyond whatever a plain parse-and-render already
+        /// normalizes away: regression coverage for blank lines collapsing
+        /// because spliced-in nodes lost their position.
+        #[test]
+        fn replace_section_content_with_unchanged_body_is_a_full_document_no_op(
+            specs in heading_tree(3),
+            path_index in any::<proptest::sample::Index>(),
+        ) {
+            let mut paths = Vec::new();
+            all_paths(&specs, &[], &mut paths);
+            prop_assume!(!paths.is_empty());
+            let path = &paths[path_index.index(paths.len())];
+            let refs: Vec<&str> = path.iter().map(String::as_str).collect();
+
+            let mut src = String::new();
+            render_specs(&specs, 1, &mut src);
+            let baseline = Document::parse(&src).unwrap().render();
+
+            let mut doc = Document::parse(&src).unwrap();
+            let range = doc.tree().find(&refs).unwrap().own_content_range.clone();
+            let unchanged_body = doc.render_range(range.clone());
+            doc.replace_section_content(range, &unchanged_body).unwrap();
+
+            assert_eq!(doc.render(), baseline);
         }
     }
 }

@@ -182,29 +182,32 @@ impl MountState {
         }
     }
 
-    fn persist(&mut self, file_idx: usize) -> std::io::Result<()> {
+    /// Refuses (`VfsError::Conflict`) rather than silently overwriting a source file changed on disk since it was last read.
+    fn persist(&mut self, file_idx: usize) -> Result<(), VfsError> {
         let file = &mut self.files[file_idx];
         let rendered = file.document.render();
-        if rendered != file.last_persisted {
-            let current_mtime = fs::metadata(&file.source_path).ok().and_then(|m| m.modified().ok());
-            if let (Some(known), Some(current)) = (file.last_known_mtime, current_mtime)
-                && current > known
-            {
-                tracing::warn!(
-                    "{} changed on disk outside the mount since it was last read; the mount's version is about to overwrite it",
-                    file.source_path.display()
-                );
-            }
-            fs::write(&file.source_path, &rendered)?;
-            file.last_persisted = rendered;
-            file.last_known_mtime = fs::metadata(&file.source_path).ok().and_then(|m| m.modified().ok());
+        if rendered == file.last_persisted {
+            return Ok(());
         }
+        let current_mtime = fs::metadata(&file.source_path).ok().and_then(|m| m.modified().ok());
+        if let (Some(known), Some(current)) = (file.last_known_mtime, current_mtime)
+            && current > known
+        {
+            tracing::warn!(
+                "{} changed on disk outside the mount since it was last read; refusing to overwrite it",
+                file.source_path.display()
+            );
+            return Err(VfsError::Conflict);
+        }
+        fs::write(&file.source_path, &rendered).map_err(|_| VfsError::Io)?;
+        file.last_persisted = rendered;
+        file.last_known_mtime = fs::metadata(&file.source_path).ok().and_then(|m| m.modified().ok());
         Ok(())
     }
 
     fn rebuild_and_persist(&mut self, file_idx: usize) -> Result<(), VfsError> {
         self.rebuild(file_idx);
-        self.persist(file_idx).map_err(|_| VfsError::Io)
+        self.persist(file_idx)
     }
 
     fn alloc_ino(&mut self) -> Ino {
@@ -346,6 +349,7 @@ fn map_mutation_error(e: MutationError) -> VfsError {
         MutationError::NotEmpty => VfsError::NotEmpty,
         MutationError::NotADirectory => VfsError::NotDir,
         MutationError::Parse(_) => VfsError::Invalid,
+        MutationError::WouldCreateCycle | MutationError::TooDeep => VfsError::Invalid,
     }
 }
 
@@ -707,7 +711,23 @@ impl MountFs for MqFs {
         }
 
         if from_parent != to_parent {
-            return Err(VfsError::Unsupported);
+            let (src_file_idx, src_parent_path) = state.dir_path(from_parent).ok_or(VfsError::NotFound)?;
+            let (dest_file_idx, dest_parent_path) = state.dir_path(to_parent).ok_or(VfsError::NotFound)?;
+            if src_file_idx != dest_file_idx {
+                // Would mean splicing content between two separate `Document`s.
+                return Err(VfsError::Unsupported);
+            }
+            let section = state
+                .find_child_section(src_file_idx, &src_parent_path, from_name)
+                .ok_or(VfsError::NotFound)?;
+            let new_parent = state
+                .find_section(dest_file_idx, &dest_parent_path)
+                .ok_or(VfsError::NotFound)?;
+            state.files[src_file_idx]
+                .document
+                .move_heading(&section, &new_parent, to_name)
+                .map_err(map_mutation_error)?;
+            return state.rebuild_and_persist(src_file_idx);
         }
         let (file_idx, parent_path) = state.dir_path(from_parent).ok_or(VfsError::NotFound)?;
         let section = state
@@ -826,6 +846,20 @@ mod tests {
     }
 
     #[test]
+    fn saving_a_multi_paragraph_section_keeps_the_blank_lines_between_paragraphs() {
+        let (fs, dir, file_ino) = mounted("# Title\n\npara one\n\npara two\n\npara three\n");
+        let content_ino = lookup_path(&fs, file_ino, &["Title", document::CONTENT_FILE]);
+
+        // Editor-style whole-file save: read the body back and write it unchanged.
+        let (bytes, _) = fs.read(content_ino, 0, 4096).unwrap();
+        fs.truncate(content_ino).unwrap();
+        fs.write(content_ino, 0, &bytes).unwrap();
+
+        let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
+        assert_eq!(persisted, "# Title\n\npara one\n\npara two\n\npara three\n");
+    }
+
+    #[test]
     fn mkdir_adds_a_heading_visible_in_readdir_and_on_disk() {
         let (fs, dir, file_ino) = mounted("# Title\n\nbody\n");
         let title_ino = fs.lookup(file_ino, "Title").unwrap();
@@ -865,6 +899,41 @@ mod tests {
         assert!(fs.lookup(file_ino, "New").is_ok());
         let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
         assert!(persisted.contains("New"));
+    }
+
+    #[test]
+    fn rename_reparents_a_heading_to_a_different_parent_and_persists() {
+        let (fs, dir, file_ino) = mounted("# A\n\nintro\n\n## B\n\nb body\n\n# C\n\nc body\n");
+        let a_ino = fs.lookup(file_ino, "A").unwrap();
+        let c_ino = fs.lookup(file_ino, "C").unwrap();
+
+        fs.rename(a_ino, "B", c_ino, "Moved").unwrap();
+
+        assert!(matches!(fs.lookup(a_ino, "B"), Err(VfsError::NotFound)));
+        let moved_ino = fs.lookup(c_ino, "Moved").unwrap();
+        let content_ino = fs.lookup(moved_ino, document::CONTENT_FILE).unwrap();
+        let (bytes, _) = fs.read(content_ino, 0, 1024).unwrap();
+        assert_eq!(bytes, b"b body\n");
+
+        let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
+        assert_eq!(persisted, "# A\n\nintro\n\n# C\n\nc body\n\n## Moved\n\nb body\n");
+    }
+
+    #[test]
+    fn rename_rejects_reparenting_across_different_mounted_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        std::fs::write(&a, "# A\n\n## Sub\n\nbody\n").unwrap();
+        std::fs::write(&b, "# B\n\nbody\n").unwrap();
+        let fs = MqFs::new(vec![(a, vec!["a".into()]), (b, vec!["b".into()])], false, false).unwrap();
+
+        let a_root = fs.lookup(ROOT_INO, "a").unwrap();
+        let a_heading = fs.lookup(a_root, "A").unwrap();
+        let b_root = fs.lookup(ROOT_INO, "b").unwrap();
+
+        let err = fs.rename(a_heading, "Sub", b_root, "Sub").unwrap_err();
+        assert!(matches!(err, VfsError::Unsupported));
     }
 
     #[test]
@@ -915,6 +984,27 @@ mod tests {
         assert!(eof);
         let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
         assert!(!persisted.contains("body"), "persisted doc was: {persisted}");
+    }
+
+    #[test]
+    fn write_refuses_to_overwrite_a_file_changed_externally_since_mount() {
+        let (fs, dir, file_ino) = mounted("# Title\n\noriginal\n");
+        let content_ino = lookup_path(&fs, file_ino, &["Title", document::CONTENT_FILE]);
+        let path = dir.path().join("doc.md");
+
+        // Simulate an external edit, mtime pushed well past mount time.
+        std::fs::write(&path, "# Title\n\nexternal edit\n").unwrap();
+        let future = SystemTime::now() + std::time::Duration::from_secs(3600);
+        std::fs::File::open(&path).unwrap().set_modified(future).unwrap();
+
+        let err = fs.truncate(content_ino).unwrap_err();
+        assert!(matches!(err, VfsError::Conflict));
+
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            persisted, "# Title\n\nexternal edit\n",
+            "external edit must survive untouched, not be overwritten"
+        );
     }
 
     #[test]

@@ -28,6 +28,9 @@ fn map_err(e: VfsError) -> nfsstat3 {
         VfsError::Unsupported => nfsstat3::NFS3ERR_NOTSUPP,
         VfsError::Invalid => nfsstat3::NFS3ERR_INVAL,
         VfsError::Io => nfsstat3::NFS3ERR_IO,
+        // Closest standard NFS errno for "the object you're operating on no
+        // longer matches what you last saw of it".
+        VfsError::Conflict => nfsstat3::NFS3ERR_STALE,
     }
 }
 

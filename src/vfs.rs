@@ -40,6 +40,9 @@ pub enum VfsError {
     Unsupported,
     Invalid,
     Io,
+    /// The source file changed on disk outside the mount since it was last
+    /// read; the write was refused rather than silently overwriting it.
+    Conflict,
 }
 
 /// A directory-tree-shaped virtual filesystem, addressed by inode. `"."` and `".."` are not passed to `lookup`; a backend resolves `"."` to the same inode itself and calls [`MountFs::parent_of`] for `".."`.

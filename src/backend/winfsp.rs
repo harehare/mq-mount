@@ -15,7 +15,9 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use widestring::U16CStr;
-use windows::Win32::Foundation::{STATUS_DIRECTORY_NOT_EMPTY, STATUS_INVALID_DEVICE_REQUEST};
+use windows::Win32::Foundation::{
+    STATUS_DIRECTORY_NOT_EMPTY, STATUS_FILE_LOCK_CONFLICT, STATUS_INVALID_DEVICE_REQUEST,
+};
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY};
 use winfsp::filesystem::{DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo, WideNameInfo};
 use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
@@ -39,6 +41,7 @@ fn map_err(e: VfsError) -> FspError {
         VfsError::Unsupported => FspError::NTSTATUS(STATUS_INVALID_DEVICE_REQUEST.0),
         VfsError::Invalid => FspError::IO(ErrorKind::InvalidInput),
         VfsError::Io => FspError::IO(ErrorKind::Other),
+        VfsError::Conflict => FspError::NTSTATUS(STATUS_FILE_LOCK_CONFLICT.0),
     }
 }
 

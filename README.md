@@ -41,7 +41,7 @@ The directories mirroring the command-line arguments (the top-level per-file dir
 - Editing `content.md` and saving splices the new text back into the source file. Typing a new heading line into it creates a new subdirectory on the next `ls`.
 - `mkdir NAME` under a directory adds a new (empty) subheading. Fails with `EEXIST` if a sibling already has that name.
 - `rmdir` is POSIX-strict: it only removes an already-empty directory (no subdirectories, empty `content.md`). Plain `rm -r somedir` still deletes a whole section and everything nested inside it, since the shell already unlinks/rmdirs bottom-up.
-- Renaming a directory renames the heading's title. Moving a directory to a *different* parent (reparenting) is not supported (`EOPNOTSUPP`) in this version. The top-level, per-file directories can't be created, removed, or renamed either (`EPERM`/`ENOENT`); the set of mounted files is fixed for the life of the mount.
+- Renaming a directory renames the heading's title. Moving a directory to a *different* parent within the same mounted file reparents the heading (and everything nested under it) there, renumbering its heading depth — and its descendants' — to fit; it's rejected (`EINVAL`) if that would nest a heading past level 6, the deepest Markdown headings go, or if the destination is inside the directory's own subtree. Reparenting across two different mounted files, and moving/renaming the top-level, per-file directories themselves, are still not supported (`EOPNOTSUPP`/`EPERM`/`ENOENT`); the set of mounted files is fixed for the life of the mount.
 - Editors that save via a temp-file-then-rename dance (common with vim's `backupcopy=auto`, VS Code, and other "atomic save" tools) are supported: renaming any file onto a canonical `content.md`/frontmatter path adopts its bytes as that section's new content.
 
 ## Use cases
@@ -53,8 +53,7 @@ The directories mirroring the command-line arguments (the top-level per-file dir
 ## Known limitations
 
 - **Not byte-exact.** Every save re-renders the *whole* document through mq-markdown. Mounting a file and saving without any edits can still normalize whitespace, blank-line counts, list markers, and table padding; mq-markdown's renderer doesn't guarantee a byte-identical round trip. mq-mount skips the rewrite when the render is unchanged from what it last wrote, to avoid *spurious* rewrites, but a first save after mount may differ from the original bytes even with no logical edit.
-- **External changes are detected but not merged.** If a source file's mtime advances outside the mount while mounted, the next write-through logs a warning before it overwrites — but it still overwrites; there's no diff/merge, so the external edit is lost. Whichever write lands last (through the mount, or externally) wins.
-- Cross-directory `mv` (reparenting a heading) is not implemented.
+- **External changes are detected but not merged.** If a source file's mtime advances outside the mount while mounted, the next write-through refuses instead of overwriting it (`ESTALE`/`STATUS_FILE_LOCK_CONFLICT`) — there's no diff/merge, so no working set of changes ever gets silently discarded, but the mount also can't reconcile the two versions for you. Unmount and remount to pick up the external edit and re-apply your change on top of it.
 - **The Windows (WinFSP) backend is unverified.** It's written against WinFSP's documented API and an example filesystem from its own repository, but hasn't yet been built or run on an actual Windows machine — see [Installation](#installation).
 
 ## Installation
