@@ -26,7 +26,7 @@ mount = ["dep:nfsserve", "dep:tokio", "dep:async-trait", "dep:winfsp", "dep:wind
 clap = {version = "4.6.1", features = ["derive"]}
 libc = "0.2"
 miette = {version = "7.6.0", features = ["fancy"]}
-mq-markdown = "0.8.2"
+mq-markdown = "0.8.3"
 rustc-hash = "2.1.2"
 thiserror = "2.0.18"
 tracing = "0.1.44"
