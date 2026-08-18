@@ -62,6 +62,26 @@ The directories mirroring the command-line arguments (the top-level per-file dir
 
 **Windows**: install [WinFSP](https://winfsp.dev) first (a separate driver, like macFUSE on macOS — there's no lighter-weight option, since Windows' own built-in NFS client is gated to Pro/Enterprise/Server editions and doesn't support the custom ports this tool needs). This backend hasn't been verified on a real Windows machine yet; see [Known limitations](#known-limitations).
 
+### Install script
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/harehare/mq-mount/main/bin/install.sh | bash
+```
+
+Downloads the latest release for your OS/architecture into `~/.local/bin`, verifying it against the release's checksums file. Pass `--bin-dir <dir>` to install elsewhere or `--no-modify-path` to skip touching your shell profile; see `--help` for details.
+
+### cargo-binstall
+
+```sh
+cargo binstall mq-mount
+```
+
+### From a release binary
+
+Download the binary for your platform from the [releases page](https://github.com/harehare/mq-mount/releases) and put it on your `PATH`.
+
+### From source
+
 ```sh
 git clone https://github.com/harehare/mq-mount
 cd mq-mount

@@ -15,6 +15,10 @@ version = "0.1.0"
 name = "mq-mount"
 path = "src/main.rs"
 
+[package.metadata.binstall]
+pkg-fmt = "bin"
+pkg-url = "{ repo }/releases/download/v{ version }/mq-mount-{ target }{ binary-ext }"
+
 [features]
 default = ["mount"]
 # The per-OS mount backend (NFSv3 on Unix, WinFSP on Windows). Split out so
