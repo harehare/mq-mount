@@ -2,12 +2,16 @@
   <img src="assets/logo.svg" style="width: 128px; height: 128px;"/>
 
 <h1>mq-mount</h1>
+
+[![CI](https://github.com/harehare/mq-mount/actions/workflows/ci.yml/badge.svg)](https://github.com/harehare/mq-mount/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/mq-mount.svg)](https://crates.io/crates/mq-mount)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 </div>
 
 > [!WARNING]
 > This project is under active development. Interfaces, behavior, and file layout may change without notice, and things may break.
 
-Mount one or more Markdown files (or directories of them) as a virtual filesystem: each file gets a top-level directory named after it, headings become subdirectories, and each section's body becomes a `content.md` file. Browse and edit a document with `ls`, `cat`, `grep`, `mkdir`, `rm`, and any regular text editor; writes are parsed back into the original Markdown via [mq-markdown](https://github.com/harehare/mq). Mounting uses the OS's built-in NFS client on macOS/Linux, and [WinFSP](https://winfsp.dev) on Windows (see [Installation](#installation)).
+Mount Markdown files as a virtual filesystem: headings become directories, section bodies become `content.md` files. Browse and edit with `ls`, `cat`, `grep`, `mkdir`, `rm`, or any text editor — writes are parsed back into the original Markdown via [mq-markdown](https://github.com/harehare/mq).
 
 Companion tool for [mq](https://github.com/harehare/mq), a jq-like CLI for Markdown.
 
