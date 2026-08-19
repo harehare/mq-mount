@@ -65,13 +65,61 @@ mod app {
             })
             .collect::<miette::Result<Vec<_>>>()?;
         let file_count = entries.len();
+        let name = mount_name(&entries);
         let filesystem = MqFs::new(entries, cli.readonly, cli.allow_other)
             .map_err(|e| miette::miette!("failed to read source file(s): {e}"))?;
 
         #[cfg(unix)]
-        return crate::backend::nfs::run(filesystem, mountpoint, file_count, cli.readonly);
+        return crate::backend::nfs::run(filesystem, mountpoint, file_count, cli.readonly, &name);
         #[cfg(windows)]
-        return crate::backend::winfsp::run(filesystem, mountpoint, file_count, cli.readonly);
+        return crate::backend::winfsp::run(filesystem, mountpoint, file_count, cli.readonly, &name);
+    }
+
+    /// Derives an export/volume name identifying this mount instance (e.g.
+    /// `mq-notes`), so multiple concurrently mounted instances are
+    /// distinguishable in `mount`/`df` output or the Windows Explorer volume
+    /// list instead of all showing up as the same fixed name.
+    fn mount_name(entries: &[(PathBuf, Vec<String>)]) -> String {
+        let mut top_level: Vec<&str> = Vec::new();
+        for (_, mount_path) in entries {
+            if let Some(first) = mount_path.first().map(String::as_str)
+                && !top_level.contains(&first)
+            {
+                top_level.push(first);
+            }
+        }
+        let label = match top_level.as_slice() {
+            [] => String::new(),
+            [only] => sanitize(only),
+            [first, rest @ ..] => format!("{}+{}", sanitize(first), rest.len()),
+        };
+        let label = if label.is_empty() { "mount".to_string() } else { label };
+        format!("mq-{}", truncate(&label, 40))
+    }
+
+    /// Keeps only ASCII alphanumerics, collapsing every other run of
+    /// characters (spaces, punctuation, non-ASCII) into a single `-`, so the
+    /// result is safe to use as an NFS export name or WinFSP filesystem/service name.
+    fn sanitize(name: &str) -> String {
+        let mut out = String::new();
+        let mut last_dash = false;
+        for c in name.chars() {
+            if c.is_ascii_alphanumeric() {
+                out.push(c);
+                last_dash = false;
+            } else if !last_dash && !out.is_empty() {
+                out.push('-');
+                last_dash = true;
+            }
+        }
+        out.trim_end_matches('-').to_string()
+    }
+
+    fn truncate(s: &str, max_chars: usize) -> &str {
+        match s.char_indices().nth(max_chars) {
+            Some((idx, _)) => &s[..idx],
+            None => s,
+        }
     }
 
     fn collect_entries(sources: &[PathBuf]) -> miette::Result<Vec<(PathBuf, Vec<String>)>> {

@@ -306,11 +306,12 @@ impl<T: MountFs> FileSystemContext for WinFspAdapter<T> {
     }
 }
 
-pub fn run(filesystem: MqFs, mountpoint: &Path, file_count: usize, readonly: bool) -> miette::Result<()> {
+pub fn run(filesystem: MqFs, mountpoint: &Path, file_count: usize, readonly: bool, name: &str) -> miette::Result<()> {
     let init = winfsp::winfsp_init().map_err(|e| miette::miette!("failed to initialize WinFSP: {e:?}"))?;
 
     let filesystem = std::sync::Mutex::new(Some(filesystem));
     let mountpoint_owned = mountpoint.to_path_buf();
+    let filesystem_name = name.to_string();
 
     let mut service = FileSystemServiceBuilder::new()
         .with_start(move || {
@@ -329,7 +330,7 @@ pub fn run(filesystem: MqFs, mountpoint: &Path, file_count: usize, readonly: boo
                 .unicode_on_disk(true)
                 .persistent_acls(false)
                 .read_only_volume(readonly)
-                .filesystem_name("mq-mount")
+                .filesystem_name(&filesystem_name)
                 .volume_creation_time(filetime(SystemTime::now()));
             let params = FileSystemParams::default_params(volume_params);
 
@@ -344,7 +345,7 @@ pub fn run(filesystem: MqFs, mountpoint: &Path, file_count: usize, readonly: boo
             }
             Ok(())
         })
-        .build("mq-mount", init)
+        .build(name, init)
         .map_err(|e| miette::miette!("failed to build WinFSP service: {e:?}"))?;
 
     service

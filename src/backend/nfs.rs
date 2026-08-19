@@ -213,25 +213,25 @@ fn nfs_mount_opts(nolock_flag: &str, port: u16, readonly: bool) -> String {
 }
 
 #[cfg(target_os = "macos")]
-fn mount_nfs(mountpoint: &Path, port: u16, readonly: bool) -> miette::Result<()> {
+fn mount_nfs(mountpoint: &Path, port: u16, readonly: bool, name: &str) -> miette::Result<()> {
     let opts = nfs_mount_opts("nolocks", port, readonly);
     run_mount_command(Command::new("mount_nfs").args([
         "-o",
         &opts,
-        "localhost:/mq-mount",
+        &format!("localhost:/{name}"),
         &mountpoint.to_string_lossy(),
     ]))
 }
 
 #[cfg(target_os = "linux")]
-fn mount_nfs(mountpoint: &Path, port: u16, readonly: bool) -> miette::Result<()> {
+fn mount_nfs(mountpoint: &Path, port: u16, readonly: bool, name: &str) -> miette::Result<()> {
     let opts = nfs_mount_opts("nolock", port, readonly);
     run_mount_command(Command::new("mount").args([
         "-t",
         "nfs",
         "-o",
         &opts,
-        "localhost:/mq-mount",
+        &format!("localhost:/{name}"),
         &mountpoint.to_string_lossy(),
     ]))
 }
@@ -259,25 +259,31 @@ fn unmount(mountpoint: &Path) -> miette::Result<()> {
     run_mount_command(Command::new("umount").arg(mountpoint))
 }
 
-pub fn run(filesystem: MqFs, mountpoint: &Path, file_count: usize, readonly: bool) -> miette::Result<()> {
+pub fn run(filesystem: MqFs, mountpoint: &Path, file_count: usize, readonly: bool, name: &str) -> miette::Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| miette::miette!("failed to start async runtime: {e}"))?
-        .block_on(run_mounted(filesystem, mountpoint, file_count, readonly))
+        .block_on(run_mounted(filesystem, mountpoint, file_count, readonly, name))
 }
 
-async fn run_mounted(filesystem: MqFs, mountpoint: &Path, file_count: usize, readonly: bool) -> miette::Result<()> {
+async fn run_mounted(
+    filesystem: MqFs,
+    mountpoint: &Path,
+    file_count: usize,
+    readonly: bool,
+    name: &str,
+) -> miette::Result<()> {
     let mut listener = NFSTcpListener::bind("127.0.0.1:0", NfsAdapter(filesystem))
         .await
         .map_err(|e| miette::miette!("failed to start NFS server: {e}"))?;
-    listener.with_export_name("mq-mount");
+    listener.with_export_name(name);
     let port = listener.get_listen_port();
     let server = tokio::spawn(async move {
         let _ = listener.handle_forever().await;
     });
 
-    mount_nfs(mountpoint, port, readonly)?;
+    mount_nfs(mountpoint, port, readonly, name)?;
     tracing::info!("mounted {file_count} file(s) at {}", mountpoint.display());
 
     tokio::signal::ctrl_c().await.ok();
