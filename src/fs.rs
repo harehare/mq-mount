@@ -708,6 +708,9 @@ impl MountFs for MqFs {
         if state.super_dirs.contains_key(&parent) {
             return Err(VfsError::PermissionDenied);
         }
+        if document::slugify(name) != name {
+            return Err(VfsError::Invalid);
+        }
         let (file_idx, parent_path) = state.dir_path(parent).ok_or(VfsError::NotFound)?;
         let parent_section = state.find_section(file_idx, &parent_path).ok_or(VfsError::NotFound)?;
 
@@ -811,6 +814,10 @@ impl MountFs for MqFs {
         if let Some(ino) = state.scratch_by_name.remove(&src_key) {
             state.scratch_by_name.insert((to_parent, to_name.to_string()), ino);
             return Ok(());
+        }
+
+        if document::slugify(to_name) != to_name {
+            return Err(VfsError::Invalid);
         }
 
         if from_parent != to_parent {
