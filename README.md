@@ -11,6 +11,8 @@ Mount one or more Markdown files (or directories of them) as a virtual filesyste
 
 Companion tool for [mq](https://github.com/harehare/mq), a jq-like CLI for Markdown.
 
+<img src="assets/demo.gif" alt="mq-mount demo: mounting a Markdown file in the background, then ls/cat-ing and editing a section" />
+
 ## How it maps
 
 ```
@@ -54,6 +56,8 @@ The directories mirroring the command-line arguments (the top-level per-file dir
 
 - **Not byte-exact.** Every save re-renders the *whole* document through mq-markdown. Mounting a file and saving without any edits can still normalize whitespace, blank-line counts, list markers, and table padding; mq-markdown's renderer doesn't guarantee a byte-identical round trip. mq-mount skips the rewrite when the render is unchanged from what it last wrote, to avoid *spurious* rewrites, but a first save after mount may differ from the original bytes even with no logical edit.
 - **External changes are detected but not merged.** If a source file's mtime advances outside the mount while mounted, the next write-through refuses instead of overwriting it (`ESTALE`/`STATUS_FILE_LOCK_CONFLICT`) — there's no diff/merge, so no working set of changes ever gets silently discarded, but the mount also can't reconcile the two versions for you. Unmount and remount to pick up the external edit and re-apply your change on top of it.
+- **`--watch` only picks up additions.** A `.md` file added under a mounted directory argument appears in the mount without a restart, but deleting or renaming an already-mounted source file outside the mount is still unnoticed, same as without `--watch`.
+- **Background mounts notice an external unmount within a couple of seconds, not instantly.** macOS/Linux poll for that every 2s. On Windows, `--stop` has no graceful cross-process signal to send, so it forcibly terminates the process; WinFSP's driver still unmounts cleanly when its hosting process dies, same as the README already notes for Ctrl-C.
 - **The Windows (WinFSP) backend is unverified.** It's written against WinFSP's documented API and an example filesystem from its own repository, but hasn't yet been built or run on an actual Windows machine — see [Installation](#installation).
 
 ## Installation
@@ -107,30 +111,46 @@ mkdir /tmp/doc-mount/README/"New Section"
 diskutil unmount /tmp/doc-mount # macOS
 umount /tmp/doc-mount           # Linux
 # Windows: Ctrl-C in the mq-mount process; WinFSP unmounts automatically.
+
+# Auto-mount new .md files added under docs/, without a restart:
+mq-mount docs/ /tmp/doc-mount --watch
+
+# Run detached from the terminal (like `docker-compose up -d`), and stop it later:
+mq-mount docs/ /tmp/doc-mount -d
+mq-mount --stop /tmp/doc-mount
+# A background mount also exits on its own if the volume is unmounted some
+# other way (Finder/Explorer eject, diskutil/umount) — no orphaned process.
 ```
 
 ### Options
 
 ```
-Usage: mq-mount [OPTIONS] <PATHS> <PATHS>...
+Usage: mq-mount [OPTIONS] [PATHS]...
 
 Arguments:
-  <PATHS> <PATHS>...  Markdown files and/or directories to mount, followed by
-                      the mount directory as the last argument (e.g. `a.md
-                      docs/ /mnt`). A directory contributes every `.md` file
-                      found under it (recursively, skipping dotfiles/dot-
-                      directories), mirroring its own layout under the
-                      directory's own name in the mount
+  [PATHS]...  Markdown files and/or directories to mount, followed by the
+              mount directory as the last argument (e.g. `a.md docs/ /mnt`).
+              A directory contributes every `.md` file found under it
+              (recursively, skipping dotfiles/dot-directories), mirroring
+              its own layout under the directory's own name in the mount.
+              Omit when using `--stop`
 
 Options:
-      --readonly     Mount read-only; all writes are rejected
-      --allow-other  Loosen file permission bits so other local users can
-                     read/write the mount (the underlying NFS server has no
-                     per-caller ACL to restrict access to the mounting user;
-                     no effect on Windows)
-  -v, --verbose      Enable verbose (debug) logging
-  -h, --help         Print help
-  -V, --version      Print version
+      --readonly           Mount read-only; all writes are rejected
+      --allow-other        Loosen file permission bits so other local users
+                            can read/write the mount (the underlying NFS
+                            server has no per-caller ACL to restrict access
+                            to the mounting user; no effect on Windows)
+      --watch              Auto-mount new .md files added under a mounted
+                            directory (additions only; see Known
+                            limitations)
+  -d, --background         Run detached from the terminal; the child keeps
+                            running once this process exits
+      --stop <MOUNTPOINT>  Stop a running mount (background or foreground)
+                            at this mountpoint and exit
+  -v, --verbose            Enable verbose (debug) logging
+  -h, --help               Print help
+  -V, --version            Print version
 ```
 
 ## Development

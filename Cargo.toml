@@ -24,13 +24,14 @@ default = ["mount"]
 # The per-OS mount backend (NFSv3 on Unix, WinFSP on Windows). Split out so
 # `document`/`fs`/`inode`/`vfs`'s core logic builds and tests without pulling
 # in the server/runtime dependencies.
-mount = ["dep:nfsserve", "dep:tokio", "dep:async-trait", "dep:winfsp", "dep:windows", "dep:widestring"]
+mount = ["dep:nfsserve", "dep:tokio", "dep:async-trait", "dep:winfsp", "dep:windows", "dep:widestring", "dep:notify"]
 
 [dependencies]
 clap = {version = "4.6.1", features = ["derive"]}
 libc = "0.2"
 miette = {version = "7.6.0", features = ["fancy"]}
 mq-markdown = "0.8.3"
+notify = { version = "8.2.0", optional = true }
 rustc-hash = "2.1.2"
 thiserror = "2.0.18"
 tracing = "0.1.44"
@@ -39,7 +40,7 @@ tracing-subscriber = {version = "0.3.23", features = ["env-filter"]}
 [target.'cfg(unix)'.dependencies]
 async-trait = { version = "0.1.92", optional = true }
 nfsserve = { version = "0.11.0", optional = true }
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "signal"], optional = true }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time", "process"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 # Windows has no lightweight user-space NFS path (the built-in NFS client is
@@ -48,7 +49,7 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "s
 # separately installed driver (https://winfsp.dev) — unverified in this repo's
 # CI beyond compiling, see README.
 winfsp = { version = "0.13", optional = true, features = ["system"] }
-windows = { version = "0.62", optional = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem"] }
+windows = { version = "0.62", optional = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 widestring = { version = "1", optional = true }
 
 [target.'cfg(windows)'.build-dependencies]

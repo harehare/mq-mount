@@ -68,3 +68,76 @@ pub trait MountFs: Send + Sync {
     fn rename(&self, from_parent: Ino, from_name: &str, to_parent: Ino, to_name: &str) -> Result<(), VfsError>;
     fn readdir(&self, ino: Ino, start_after: Ino, max_entries: usize) -> Result<(Vec<DirEntryOwned>, bool), VfsError>;
 }
+
+/// Lets a backend and a background task (e.g. a directory watcher) share one
+/// filesystem instance behind an `Arc`, without every call site needing to
+/// know whether it's holding the owned filesystem or a shared handle to it.
+impl<T: MountFs + ?Sized> MountFs for std::sync::Arc<T> {
+    fn root_ino(&self) -> Ino {
+        (**self).root_ino()
+    }
+
+    fn readonly(&self) -> bool {
+        (**self).readonly()
+    }
+
+    fn allow_other(&self) -> bool {
+        (**self).allow_other()
+    }
+
+    fn uid(&self) -> u32 {
+        (**self).uid()
+    }
+
+    fn gid(&self) -> u32 {
+        (**self).gid()
+    }
+
+    fn lookup(&self, parent: Ino, name: &str) -> Result<Ino, VfsError> {
+        (**self).lookup(parent, name)
+    }
+
+    fn parent_of(&self, ino: Ino) -> Result<Ino, VfsError> {
+        (**self).parent_of(ino)
+    }
+
+    fn getattr(&self, ino: Ino) -> Result<FileAttr, VfsError> {
+        (**self).getattr(ino)
+    }
+
+    fn truncate(&self, ino: Ino) -> Result<FileAttr, VfsError> {
+        (**self).truncate(ino)
+    }
+
+    fn read(&self, ino: Ino, offset: u64, count: u32) -> Result<(Vec<u8>, bool), VfsError> {
+        (**self).read(ino, offset, count)
+    }
+
+    fn write(&self, ino: Ino, offset: u64, data: &[u8]) -> Result<FileAttr, VfsError> {
+        (**self).write(ino, offset, data)
+    }
+
+    fn create(&self, parent: Ino, name: &str) -> Result<(Ino, FileAttr), VfsError> {
+        (**self).create(parent, name)
+    }
+
+    fn create_exclusive(&self, parent: Ino, name: &str) -> Result<Ino, VfsError> {
+        (**self).create_exclusive(parent, name)
+    }
+
+    fn mkdir(&self, parent: Ino, name: &str) -> Result<(Ino, FileAttr), VfsError> {
+        (**self).mkdir(parent, name)
+    }
+
+    fn remove(&self, parent: Ino, name: &str) -> Result<(), VfsError> {
+        (**self).remove(parent, name)
+    }
+
+    fn rename(&self, from_parent: Ino, from_name: &str, to_parent: Ino, to_name: &str) -> Result<(), VfsError> {
+        (**self).rename(from_parent, from_name, to_parent, to_name)
+    }
+
+    fn readdir(&self, ino: Ino, start_after: Ino, max_entries: usize) -> Result<(Vec<DirEntryOwned>, bool), VfsError> {
+        (**self).readdir(ino, start_after, max_entries)
+    }
+}

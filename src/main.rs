@@ -7,9 +7,16 @@ mod vfs;
 mod backend;
 
 #[cfg(feature = "mount")]
+mod daemon;
+
+#[cfg(feature = "mount")]
+mod watch;
+
+#[cfg(feature = "mount")]
 mod app {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
     use clap::Parser;
 
@@ -22,8 +29,8 @@ mod app {
     #[derive(Parser, Debug)]
     #[command(name = "mq-mount", author, version, about, long_about = None)]
     pub struct Cli {
-        /// Markdown files and/or directories to mount, followed by the mount directory as the last argument (e.g. `a.md docs/ /mnt`).
-        #[arg(required = true, num_args = 2..)]
+        /// Markdown files and/or directories to mount, followed by the mount directory as the last argument (e.g. `a.md docs/ /mnt`). Omit when using `--stop`.
+        #[arg(num_args = 0..)]
         paths: Vec<PathBuf>,
         /// Mount read-only; all writes are rejected
         #[arg(long)]
@@ -31,6 +38,15 @@ mod app {
         /// Loosen file permission bits so other local users can read/write the mount (the underlying NFS server has no per-caller ACL to restrict access to the mounting user; no effect on Windows)
         #[arg(long)]
         allow_other: bool,
+        /// Auto-mount new .md files added under a mounted directory
+        #[arg(long)]
+        watch: bool,
+        /// Run detached from the terminal; the child keeps running once this process exits
+        #[arg(short = 'd', long)]
+        background: bool,
+        /// Stop a running mount (background or foreground) at this mountpoint and exit
+        #[arg(long, value_name = "MOUNTPOINT", conflicts_with_all = ["paths", "readonly", "allow_other", "watch", "background"])]
+        stop: Option<PathBuf>,
         /// Enable verbose (debug) logging
         #[arg(short, long)]
         verbose: bool,
@@ -44,6 +60,14 @@ mod app {
             .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
             .init();
 
+        if let Some(mountpoint) = &cli.stop {
+            return crate::daemon::stop(mountpoint);
+        }
+
+        if cli.paths.len() < 2 {
+            miette::bail!("expected at least a source and a mount directory (e.g. `mq-mount a.md /mnt`)");
+        }
+
         let split_at = cli.paths.len() - 1;
         let (sources, mountpoint) = cli.paths.split_at(split_at);
         let mountpoint = &mountpoint[0];
@@ -54,6 +78,12 @@ mod app {
                 mountpoint.display()
             );
         }
+        // Canonicalized so it matches how `--stop` resolves the same path
+        // (e.g. macOS's /var/folders -> /private/var/folders), and used
+        // consistently for the pid file and the background re-exec below.
+        let mountpoint = &mountpoint
+            .canonicalize()
+            .map_err(|e| miette::miette!("failed to resolve {}: {e}", mountpoint.display()))?;
 
         let entries = collect_entries(sources)?;
         let entries = entries
@@ -66,13 +96,50 @@ mod app {
             .collect::<miette::Result<Vec<_>>>()?;
         let file_count = entries.len();
         let name = mount_name(&entries);
-        let filesystem = MqFs::new(entries, cli.readonly, cli.allow_other)
-            .map_err(|e| miette::miette!("failed to read source file(s): {e}"))?;
+
+        let watch_roots = watch_roots_for(sources, cli.watch)?;
+
+        if cli.background {
+            return crate::daemon::spawn_background(mountpoint);
+        }
+
+        let filesystem = Arc::new(
+            MqFs::new(entries, cli.readonly, cli.allow_other)
+                .map_err(|e| miette::miette!("failed to read source file(s): {e}"))?,
+        );
+        if !watch_roots.is_empty() {
+            crate::watch::spawn_watchers(Arc::clone(&filesystem), watch_roots);
+        }
+
+        let _pidfile = crate::daemon::PidFileGuard::create(mountpoint)
+            .map_err(|e| miette::miette!("failed to write pid file: {e}"))?;
 
         #[cfg(unix)]
         return crate::backend::nfs::run(filesystem, mountpoint, file_count, cli.readonly, &name);
         #[cfg(windows)]
         return crate::backend::winfsp::run(filesystem, mountpoint, file_count, cli.readonly, &name);
+    }
+
+    /// Canonical `(directory, base mount-path prefix)` for every directory
+    /// source argument, when `--watch` is set; empty (with a warning) if
+    /// `--watch` was given but every source is a plain file.
+    fn watch_roots_for(sources: &[PathBuf], watch: bool) -> miette::Result<Vec<(PathBuf, Vec<String>)>> {
+        if !watch {
+            return Ok(Vec::new());
+        }
+        let roots = sources
+            .iter()
+            .filter(|s| s.is_dir())
+            .map(|s| {
+                s.canonicalize()
+                    .map(|resolved| (resolved, vec![stem_or_name(s)]))
+                    .map_err(|e| miette::miette!("failed to resolve {}: {e}", s.display()))
+            })
+            .collect::<miette::Result<Vec<_>>>()?;
+        if roots.is_empty() {
+            tracing::warn!("--watch has no effect: none of the given sources are directories");
+        }
+        Ok(roots)
     }
 
     /// Derives an export/volume name identifying this mount instance (e.g.

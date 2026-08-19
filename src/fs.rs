@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::document::{self, Document, FrontMatterKind, MutationError, Section};
 use crate::inode::{InodeTable, MountPath, ROOT_INO};
@@ -33,9 +33,32 @@ struct FileMount {
     last_known_mtime: Option<SystemTime>,
 }
 
+impl FileMount {
+    fn open(source_path: PathBuf, next_ino: &mut Ino) -> std::io::Result<Self> {
+        let text = fs::read_to_string(&source_path)?;
+        let mtime = fs::metadata(&source_path).ok().and_then(|m| m.modified().ok());
+        let document = Document::parse(&text).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let tree = document.tree();
+        let mut inodes = InodeTable::new();
+        inodes.sync(next_ino, &tree);
+        Ok(Self {
+            document,
+            tree,
+            inodes,
+            source_path,
+            last_persisted: text,
+            last_known_mtime: mtime,
+        })
+    }
+}
+
 struct SuperDir {
     parent: Ino,
     children: Vec<(String, Ino)>,
+    /// Collision-suffix counters for this level's raw names, carried forward
+    /// so a later incremental insert (see [`MountState::add_file`]) stays
+    /// consistent with siblings created at mount time.
+    seen_names: FxHashMap<String, u32>,
 }
 
 struct MountState {
@@ -46,6 +69,9 @@ struct MountState {
     next_ino: Ino,
     scratch: FxHashMap<Ino, Vec<u8>>,
     scratch_by_name: FxHashMap<(Ino, String), Ino>,
+    /// Canonicalized source paths already mounted, so a watcher re-notified
+    /// about the same file (or a file it opened before mount) is a no-op.
+    mounted_paths: FxHashSet<PathBuf>,
     readonly: bool,
     allow_other: bool,
     uid: u32,
@@ -57,23 +83,12 @@ impl MountState {
         let mut next_ino = ROOT_INO + 1;
         let mut files = Vec::with_capacity(entries.len());
         let mut mount_paths = Vec::with_capacity(entries.len());
+        let mut mounted_paths = FxHashSet::default();
         for (source_path, mount_path) in entries {
-            let text = fs::read_to_string(&source_path)?;
-            let mtime = fs::metadata(&source_path).ok().and_then(|m| m.modified().ok());
-            let document = Document::parse(&text).map_err(|e| std::io::Error::other(e.to_string()))?;
-            let tree = document.tree();
-            let mut inodes = InodeTable::new();
-            inodes.sync(&mut next_ino, &tree);
-
+            let file = FileMount::open(source_path.clone(), &mut next_ino)?;
+            mounted_paths.insert(source_path);
             mount_paths.push(mount_path);
-            files.push(FileMount {
-                document,
-                tree,
-                inodes,
-                source_path,
-                last_persisted: text,
-                last_known_mtime: mtime,
-            });
+            files.push(file);
         }
 
         let mut ino_owner = FxHashMap::default();
@@ -91,6 +106,7 @@ impl MountState {
             next_ino,
             scratch: FxHashMap::default(),
             scratch_by_name: FxHashMap::default(),
+            mounted_paths,
             readonly,
             allow_other,
             uid: 0,
@@ -101,19 +117,93 @@ impl MountState {
         state.gid = gid;
 
         let leaves: Vec<(usize, Vec<String>)> = mount_paths.into_iter().enumerate().collect();
-        let root_children = state.build_super_level(ROOT_INO, leaves);
+        let (root_children, root_seen) = state.build_super_level(ROOT_INO, leaves);
         state.super_dirs.insert(
             ROOT_INO,
             SuperDir {
                 parent: ROOT_INO,
                 children: root_children,
+                seen_names: root_seen,
             },
         );
 
         Ok(state)
     }
 
-    fn build_super_level(&mut self, parent_ino: Ino, entries: Vec<(usize, Vec<String>)>) -> Vec<(String, Ino)> {
+    /// Adds a single newly-discovered file to an already-running mount,
+    /// creating any missing intermediate super-directories along
+    /// `mount_path` on demand. Used by the `--watch` file watcher; a no-op
+    /// if `source_path` is already mounted.
+    fn add_file(&mut self, source_path: PathBuf, mount_path: Vec<String>) -> std::io::Result<()> {
+        if mount_path.is_empty() || self.mounted_paths.contains(&source_path) {
+            return Ok(());
+        }
+
+        let file = FileMount::open(source_path.clone(), &mut self.next_ino)?;
+        let file_idx = self.files.len();
+        let entry_inos: Vec<Ino> = file.inodes.entries().map(|(ino, _)| ino).collect();
+        let root_ino = file.inodes.root_dir_ino();
+        self.files.push(file);
+        for ino in entry_inos {
+            self.ino_owner.insert(ino, file_idx);
+        }
+        self.mounted_paths.insert(source_path);
+
+        let mut parent_ino = ROOT_INO;
+        for component in &mount_path[..mount_path.len() - 1] {
+            parent_ino = self.get_or_create_super_dir(parent_ino, component);
+        }
+        let super_dir = self
+            .super_dirs
+            .get_mut(&parent_ino)
+            .expect("parent super dir must exist");
+        let name = document::unique_name(&mut super_dir.seen_names, mount_path.last().unwrap());
+        super_dir.children.push((name, root_ino));
+        self.file_root_parent.insert(file_idx, parent_ino);
+        Ok(())
+    }
+
+    /// Finds an existing subdirectory named `raw_name` directly under
+    /// `parent_ino`, or creates one. Matches by exact (unsuffixed) name,
+    /// which holds as long as `raw_name` didn't collide with a sibling at
+    /// mount time — the same rare edge case [`Self::build_super_level`]
+    /// resolves with a `-2`-style suffix.
+    fn get_or_create_super_dir(&mut self, parent_ino: Ino, raw_name: &str) -> Ino {
+        let existing = self.super_dirs.get(&parent_ino).and_then(|sd| {
+            sd.children
+                .iter()
+                .find(|(name, _)| name == raw_name)
+                .map(|&(_, ino)| ino)
+        });
+        if let Some(ino) = existing
+            && self.super_dirs.contains_key(&ino)
+        {
+            return ino;
+        }
+
+        let ino = self.alloc_ino();
+        self.super_dirs.insert(
+            ino,
+            SuperDir {
+                parent: parent_ino,
+                children: Vec::new(),
+                seen_names: FxHashMap::default(),
+            },
+        );
+        let parent = self
+            .super_dirs
+            .get_mut(&parent_ino)
+            .expect("parent super dir must exist");
+        let name = document::unique_name(&mut parent.seen_names, raw_name);
+        parent.children.push((name, ino));
+        ino
+    }
+
+    fn build_super_level(
+        &mut self,
+        parent_ino: Ino,
+        entries: Vec<(usize, Vec<String>)>,
+    ) -> (Vec<(String, Ino)>, FxHashMap<String, u32>) {
         let mut order: Vec<String> = Vec::new();
         let mut buckets: FxHashMap<String, Vec<(usize, Vec<String>)>> = FxHashMap::default();
         for entry in entries {
@@ -142,12 +232,13 @@ impl MountState {
             if !subdirs.is_empty() {
                 let name = document::unique_name(&mut seen_names, &raw_name);
                 let ino = self.alloc_ino();
-                let grandchildren = self.build_super_level(ino, subdirs);
+                let (grandchildren, grandchildren_seen) = self.build_super_level(ino, subdirs);
                 self.super_dirs.insert(
                     ino,
                     SuperDir {
                         parent: parent_ino,
                         children: grandchildren,
+                        seen_names: grandchildren_seen,
                     },
                 );
                 children.push((name, ino));
@@ -160,7 +251,7 @@ impl MountState {
             }
         }
 
-        children
+        (children, seen_names)
     }
 
     fn rebuild(&mut self, file_idx: usize) {
@@ -400,6 +491,18 @@ impl MqFs {
         Ok(Self {
             state: Mutex::new(MountState::open(entries, readonly, allow_other)?),
         })
+    }
+
+    /// Adds a file discovered after mount time (used by `--watch`); logs and
+    /// swallows errors rather than propagating, since a transient read
+    /// failure (e.g. an editor still writing the file) should just be
+    /// retried on the next filesystem event, not tear down the mount.
+    pub fn watch_add(&self, source_path: PathBuf, mount_path: Vec<String>) {
+        let mut state = self.state.lock().unwrap();
+        match state.add_file(source_path.clone(), mount_path) {
+            Ok(()) => tracing::info!("auto-mounted {}", source_path.display()),
+            Err(e) => tracing::warn!("failed to auto-mount {}: {e}", source_path.display()),
+        }
     }
 }
 
@@ -1117,5 +1220,71 @@ mod tests {
 
         let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
         assert!(persisted.contains("key: 2"), "persisted doc was: {persisted}");
+    }
+
+    #[test]
+    fn watch_add_mounts_a_new_top_level_file() {
+        let (fs, dir, _file_ino) = mounted("# Doc\n\nbody\n");
+        let new_path = dir.path().join("extra.md");
+        std::fs::write(&new_path, "# Extra\n\nnew body\n").unwrap();
+
+        fs.watch_add(new_path.canonicalize().unwrap(), vec!["extra".to_string()]);
+
+        let extra_ino = fs.lookup(ROOT_INO, "extra").unwrap();
+        let heading_ino = fs.lookup(extra_ino, "Extra").unwrap();
+        let content_ino = fs.lookup(heading_ino, document::CONTENT_FILE).unwrap();
+        let (bytes, _) = fs.read(content_ino, 0, 1024).unwrap();
+        assert_eq!(bytes, b"new body\n");
+    }
+
+    #[test]
+    fn watch_add_creates_missing_intermediate_directories() {
+        let (fs, dir, _file_ino) = mounted("# Doc\n\nbody\n");
+        std::fs::create_dir_all(dir.path().join("docs/guide")).unwrap();
+        let new_path = dir.path().join("docs/guide/a.md");
+        std::fs::write(&new_path, "# A\n").unwrap();
+
+        fs.watch_add(
+            new_path.canonicalize().unwrap(),
+            vec!["docs".to_string(), "guide".to_string(), "a".to_string()],
+        );
+
+        let docs_ino = fs.lookup(ROOT_INO, "docs").unwrap();
+        let guide_ino = fs.lookup(docs_ino, "guide").unwrap();
+        assert!(fs.lookup(guide_ino, "a").is_ok());
+    }
+
+    #[test]
+    fn watch_add_reuses_an_existing_intermediate_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+        let a = dir.path().join("docs/a.md");
+        std::fs::write(&a, "# A\n").unwrap();
+        let fs = MqFs::new(vec![(a, vec!["docs".into(), "a".into()])], false, false).unwrap();
+        let docs_ino_before = fs.lookup(ROOT_INO, "docs").unwrap();
+
+        let b = dir.path().join("docs/b.md");
+        std::fs::write(&b, "# B\n").unwrap();
+        fs.watch_add(b.canonicalize().unwrap(), vec!["docs".to_string(), "b".to_string()]);
+
+        let docs_ino_after = fs.lookup(ROOT_INO, "docs").unwrap();
+        assert_eq!(
+            docs_ino_before, docs_ino_after,
+            "must reuse the existing docs/ directory"
+        );
+        assert!(fs.lookup(docs_ino_after, "a").is_ok());
+        assert!(fs.lookup(docs_ino_after, "b").is_ok());
+    }
+
+    #[test]
+    fn watch_add_ignores_a_path_already_mounted() {
+        let (fs, dir, file_ino) = mounted("# Doc\n\nbody\n");
+        // Matches the exact (non-canonicalized) path `mounted()` mounted it under.
+        let doc_path = dir.path().join("doc.md");
+
+        fs.watch_add(doc_path, vec!["doc-2".to_string()]);
+
+        assert!(matches!(fs.lookup(ROOT_INO, "doc-2"), Err(VfsError::NotFound)));
+        assert!(fs.lookup(file_ino, "Doc").is_ok());
     }
 }

@@ -11,7 +11,6 @@ use nfsserve::nfs::{fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfst
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 
-use crate::fs::MqFs;
 use crate::vfs::{DirEntryOwned, FileAttr, FileKind, MountFs, VfsError};
 
 struct NfsAdapter<T: MountFs>(T);
@@ -259,7 +258,26 @@ fn unmount(mountpoint: &Path) -> miette::Result<()> {
     run_mount_command(Command::new("umount").arg(mountpoint))
 }
 
-pub fn run(filesystem: MqFs, mountpoint: &Path, file_count: usize, readonly: bool, name: &str) -> miette::Result<()> {
+/// True while `mountpoint`'s device id still differs from its parent's (i.e.
+/// something is still mounted there, by us or externally).
+fn is_still_mounted(mountpoint: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some(parent) = mountpoint.parent() else {
+        return true;
+    };
+    let (Ok(here), Ok(up)) = (std::fs::metadata(mountpoint), std::fs::metadata(parent)) else {
+        return false;
+    };
+    here.dev() != up.dev()
+}
+
+pub fn run<T: MountFs + Send + Sync + 'static>(
+    filesystem: T,
+    mountpoint: &Path,
+    file_count: usize,
+    readonly: bool,
+    name: &str,
+) -> miette::Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -267,8 +285,8 @@ pub fn run(filesystem: MqFs, mountpoint: &Path, file_count: usize, readonly: boo
         .block_on(run_mounted(filesystem, mountpoint, file_count, readonly, name))
 }
 
-async fn run_mounted(
-    filesystem: MqFs,
+async fn run_mounted<T: MountFs + Send + Sync + 'static>(
+    filesystem: T,
     mountpoint: &Path,
     file_count: usize,
     readonly: bool,
@@ -286,10 +304,30 @@ async fn run_mounted(
     mount_nfs(mountpoint, port, readonly, name)?;
     tracing::info!("mounted {file_count} file(s) at {}", mountpoint.display());
 
-    tokio::signal::ctrl_c().await.ok();
+    let mut poll_unmounted = tokio::time::interval(std::time::Duration::from_secs(2));
+    poll_unmounted.tick().await;
 
-    tracing::info!("unmounting");
-    unmount(mountpoint)?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| miette::miette!("failed to install SIGTERM handler: {e}"))?;
+
+    let externally_unmounted = loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break false,
+            _ = sigterm.recv() => break false,
+            _ = poll_unmounted.tick() => {
+                if !is_still_mounted(mountpoint) {
+                    break true;
+                }
+            }
+        }
+    };
+
+    if externally_unmounted {
+        tracing::info!("unmounted externally; shutting down");
+    } else {
+        tracing::info!("unmounting");
+        unmount(mountpoint)?;
+    }
     server.abort();
     Ok(())
 }

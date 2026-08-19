@@ -24,7 +24,6 @@ use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 use winfsp::service::FileSystemServiceBuilder;
 use winfsp::{FspError, Result as FspResult};
 
-use crate::fs::MqFs;
 use crate::vfs::{FileAttr, FileKind, Ino, MountFs, VfsError};
 
 struct WinFspAdapter<T: MountFs>(T);
@@ -306,7 +305,13 @@ impl<T: MountFs> FileSystemContext for WinFspAdapter<T> {
     }
 }
 
-pub fn run(filesystem: MqFs, mountpoint: &Path, file_count: usize, readonly: bool, name: &str) -> miette::Result<()> {
+pub fn run<T: MountFs + Send + Sync + 'static>(
+    filesystem: T,
+    mountpoint: &Path,
+    file_count: usize,
+    readonly: bool,
+    name: &str,
+) -> miette::Result<()> {
     let init = winfsp::winfsp_init().map_err(|e| miette::miette!("failed to initialize WinFSP: {e:?}"))?;
 
     let filesystem = std::sync::Mutex::new(Some(filesystem));
