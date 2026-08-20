@@ -125,7 +125,7 @@ impl<T: MountFs> FileSystemContext for WinFspAdapter<T> {
         &self,
         file_name: &U16CStr,
         _create_options: u32,
-        _granted_access: winfsp::filesystem::FILE_ACCESS_RIGHTS,
+        _granted_access: winfsp_sys::FILE_ACCESS_RIGHTS,
         file_info: &mut OpenFileInfo,
     ) -> FspResult<Self::FileContext> {
         let ino = self.resolve(file_name)?;
@@ -141,8 +141,8 @@ impl<T: MountFs> FileSystemContext for WinFspAdapter<T> {
         &self,
         file_name: &U16CStr,
         create_options: u32,
-        _granted_access: winfsp::filesystem::FILE_ACCESS_RIGHTS,
-        _file_attributes: winfsp::filesystem::FILE_FLAGS_AND_ATTRIBUTES,
+        _granted_access: winfsp_sys::FILE_ACCESS_RIGHTS,
+        _file_attributes: winfsp_sys::FILE_FLAGS_AND_ATTRIBUTES,
         _security_descriptor: Option<&[c_void]>,
         _allocation_size: u64,
         _extra_buffer: Option<&[u8]>,
@@ -339,7 +339,8 @@ pub fn run<T: MountFs + Send + Sync + 'static>(
                 .volume_creation_time(filetime(SystemTime::now()));
             let params = FileSystemParams::default_params(volume_params);
 
-            let mut host = FileSystemHost::new_with_options(params, WinFspAdapter(fs))?;
+            let mut host: FileSystemHost<WinFspAdapter<T>> =
+                FileSystemHost::new_with_options(params, WinFspAdapter(fs))?;
             host.mount(&mountpoint_owned)?;
             host.start()?;
             Ok(host)

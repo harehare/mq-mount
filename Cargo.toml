@@ -24,7 +24,7 @@ default = ["mount"]
 # The per-OS mount backend (NFSv3 on Unix, WinFSP on Windows). Split out so
 # `document`/`fs`/`inode`/`vfs`'s core logic builds and tests without pulling
 # in the server/runtime dependencies.
-mount = ["dep:nfsserve", "dep:tokio", "dep:async-trait", "dep:winfsp", "dep:windows", "dep:widestring", "dep:notify"]
+mount = ["dep:nfsserve", "dep:tokio", "dep:async-trait", "dep:winfsp", "dep:winfsp-sys", "dep:windows", "dep:widestring", "dep:notify"]
 
 [dependencies]
 clap = {version = "4.6.1", features = ["derive"]}
@@ -49,6 +49,7 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "s
 # separately installed driver (https://winfsp.dev) — unverified in this repo's
 # CI beyond compiling, see README.
 winfsp = { version = "0.13", optional = true, features = ["system"] }
+winfsp-sys = { version = "0.12", optional = true }
 windows = { version = "0.62", optional = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 widestring = { version = "1", optional = true }
 

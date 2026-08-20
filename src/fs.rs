@@ -112,9 +112,12 @@ impl MountState {
             uid: 0,
             gid: 0,
         };
-        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-        state.uid = uid;
-        state.gid = gid;
+        #[cfg(unix)]
+        {
+            let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+            state.uid = uid;
+            state.gid = gid;
+        }
 
         let leaves: Vec<(usize, Vec<String>)> = mount_paths.into_iter().enumerate().collect();
         let (root_children, root_seen) = state.build_super_level(ROOT_INO, leaves);
