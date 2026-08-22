@@ -24,10 +24,11 @@ default = ["mount"]
 # The per-OS mount backend (NFSv3 on Unix, WinFSP on Windows). Split out so
 # `document`/`fs`/`inode`/`vfs`'s core logic builds and tests without pulling
 # in the server/runtime dependencies.
-mount = ["dep:nfsserve", "dep:tokio", "dep:async-trait", "dep:winfsp", "dep:winfsp-sys", "dep:windows", "dep:widestring", "dep:notify"]
+mount = ["dep:nfsserve", "dep:tokio", "dep:async-trait", "dep:winfsp", "dep:winfsp-sys", "dep:windows", "dep:widestring", "dep:notify", "dep:glob"]
 
 [dependencies]
 clap = {version = "4.6.1", features = ["derive"]}
+glob = { version = "0.3", optional = true }
 libc = "0.2"
 miette = {version = "7.6.0", features = ["fancy"]}
 mq-markdown = "0.8.3"

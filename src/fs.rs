@@ -18,11 +18,15 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use crate::document::{self, Document, FrontMatterKind, MutationError, Section};
 use crate::inode::{InodeTable, MountPath, ROOT_INO};
 use crate::vfs::{DirEntryOwned, FileAttr, FileKind, Ino, MountFs, VfsError};
+
+/// The synthetic, read-only heading-tree listing exposed at a mounted file's
+/// root when the mount was started with `--toc`.
+const TOC_FILE: &str = "_toc.md";
 
 struct FileMount {
     document: Document,
@@ -31,16 +35,24 @@ struct FileMount {
     source_path: PathBuf,
     last_persisted: String,
     last_known_mtime: Option<SystemTime>,
+    /// Set by a deferred (write()-driven) commit; cleared once a flush
+    /// persists it. See [`MountState::persist`] / [`MqFs::flush`].
+    dirty: bool,
+    /// Set once this file's source disappeared (or was renamed away) while
+    /// `--watch`ing; its `FileMount` stays in `MountState::files` (indices
+    /// are load-bearing elsewhere) but is unreachable and excluded from
+    /// background flush/reload.
+    removed: bool,
 }
 
 impl FileMount {
-    fn open(source_path: PathBuf, next_ino: &mut Ino) -> std::io::Result<Self> {
+    fn open(source_path: PathBuf, next_ino: &mut Ino, toc_enabled: bool) -> std::io::Result<Self> {
         let text = fs::read_to_string(&source_path)?;
         let mtime = fs::metadata(&source_path).ok().and_then(|m| m.modified().ok());
         let document = Document::parse(&text).map_err(|e| std::io::Error::other(e.to_string()))?;
         let tree = document.tree();
         let mut inodes = InodeTable::new();
-        inodes.sync(next_ino, &tree);
+        inodes.sync(next_ino, &tree, toc_enabled);
         Ok(Self {
             document,
             tree,
@@ -48,6 +60,8 @@ impl FileMount {
             source_path,
             last_persisted: text,
             last_known_mtime: mtime,
+            dirty: false,
+            removed: false,
         })
     }
 }
@@ -69,24 +83,37 @@ struct MountState {
     next_ino: Ino,
     scratch: FxHashMap<Ino, Vec<u8>>,
     scratch_by_name: FxHashMap<(Ino, String), Ino>,
-    /// Canonicalized source paths already mounted, so a watcher re-notified
-    /// about the same file (or a file it opened before mount) is a no-op.
-    mounted_paths: FxHashSet<PathBuf>,
+    /// Rendered `content.md`/frontmatter bytes, memoized until the next
+    /// `rebuild()` of their owning file invalidates them. Read-heavy
+    /// workloads (`ls`, `grep -r`, an agent walking the tree) hit this
+    /// instead of re-rendering through `mq_markdown` on every call.
+    content_cache: FxHashMap<Ino, Vec<u8>>,
+    /// Canonicalized source paths already mounted, keyed to their `files`
+    /// index so a watcher can look a path back up to unmount it.
+    mounted_paths: FxHashMap<PathBuf, usize>,
     readonly: bool,
     allow_other: bool,
     uid: u32,
     gid: u32,
+    /// Whether every mounted file exposes a synthetic, read-only `_toc.md`
+    /// at its root (`--toc`).
+    toc: bool,
 }
 
 impl MountState {
-    fn open(entries: Vec<(PathBuf, Vec<String>)>, readonly: bool, allow_other: bool) -> std::io::Result<Self> {
+    fn open(
+        entries: Vec<(PathBuf, Vec<String>)>,
+        readonly: bool,
+        allow_other: bool,
+        toc: bool,
+    ) -> std::io::Result<Self> {
         let mut next_ino = ROOT_INO + 1;
         let mut files = Vec::with_capacity(entries.len());
         let mut mount_paths = Vec::with_capacity(entries.len());
-        let mut mounted_paths = FxHashSet::default();
-        for (source_path, mount_path) in entries {
-            let file = FileMount::open(source_path.clone(), &mut next_ino)?;
-            mounted_paths.insert(source_path);
+        let mut mounted_paths = FxHashMap::default();
+        for (idx, (source_path, mount_path)) in entries.into_iter().enumerate() {
+            let file = FileMount::open(source_path.clone(), &mut next_ino, toc)?;
+            mounted_paths.insert(source_path, idx);
             mount_paths.push(mount_path);
             files.push(file);
         }
@@ -106,11 +133,13 @@ impl MountState {
             next_ino,
             scratch: FxHashMap::default(),
             scratch_by_name: FxHashMap::default(),
+            content_cache: FxHashMap::default(),
             mounted_paths,
             readonly,
             allow_other,
             uid: 0,
             gid: 0,
+            toc,
         };
         #[cfg(unix)]
         {
@@ -138,11 +167,11 @@ impl MountState {
     /// `mount_path` on demand. Used by the `--watch` file watcher; a no-op
     /// if `source_path` is already mounted.
     fn add_file(&mut self, source_path: PathBuf, mount_path: Vec<String>) -> std::io::Result<()> {
-        if mount_path.is_empty() || self.mounted_paths.contains(&source_path) {
+        if mount_path.is_empty() || self.mounted_paths.contains_key(&source_path) {
             return Ok(());
         }
 
-        let file = FileMount::open(source_path.clone(), &mut self.next_ino)?;
+        let file = FileMount::open(source_path.clone(), &mut self.next_ino, self.toc)?;
         let file_idx = self.files.len();
         let entry_inos: Vec<Ino> = file.inodes.entries().map(|(ino, _)| ino).collect();
         let root_ino = file.inodes.root_dir_ino();
@@ -150,7 +179,7 @@ impl MountState {
         for ino in entry_inos {
             self.ino_owner.insert(ino, file_idx);
         }
-        self.mounted_paths.insert(source_path);
+        self.mounted_paths.insert(source_path, file_idx);
 
         let mut parent_ino = ROOT_INO;
         for component in &mount_path[..mount_path.len() - 1] {
@@ -164,6 +193,31 @@ impl MountState {
         super_dir.children.push((name, root_ino));
         self.file_root_parent.insert(file_idx, parent_ino);
         Ok(())
+    }
+
+    /// Unmounts a single file whose source disappeared (deleted or renamed
+    /// away) while `--watch`ing: purges its inodes and its entry in the
+    /// parent super-directory, and flags it so a background flush/reload
+    /// tick skips it. Returns `false` if `source_path` wasn't mounted.
+    fn remove_file(&mut self, source_path: &std::path::Path) -> bool {
+        let Some(file_idx) = self.mounted_paths.remove(source_path) else {
+            return false;
+        };
+        let file = &mut self.files[file_idx];
+        file.removed = true;
+        file.dirty = false;
+        let root_ino = file.inodes.root_dir_ino();
+        let old_inos: Vec<Ino> = file.inodes.entries().map(|(ino, _)| ino).collect();
+        for ino in old_inos {
+            self.ino_owner.remove(&ino);
+            self.content_cache.remove(&ino);
+        }
+        if let Some(parent_ino) = self.file_root_parent.remove(&file_idx)
+            && let Some(super_dir) = self.super_dirs.get_mut(&parent_ino)
+        {
+            super_dir.children.retain(|(_, ino)| *ino != root_ino);
+        }
+        true
     }
 
     /// Finds an existing subdirectory named `raw_name` directly under
@@ -262,14 +316,19 @@ impl MountState {
             files,
             next_ino,
             ino_owner,
+            content_cache,
+            toc,
             ..
         } = self;
         let file = &mut files[file_idx];
         let old_inos: Vec<Ino> = file.inodes.entries().map(|(ino, _)| ino).collect();
         file.tree = file.document.tree();
-        file.inodes.sync(next_ino, &file.tree);
+        file.inodes.sync(next_ino, &file.tree, *toc);
         for ino in old_inos {
             ino_owner.remove(&ino);
+            // Ranges shift on any edit, so a survived ino's cached bytes are
+            // no longer trustworthy either; let it repopulate lazily.
+            content_cache.remove(&ino);
         }
         for (ino, _) in file.inodes.entries() {
             ino_owner.insert(ino, file_idx);
@@ -281,6 +340,7 @@ impl MountState {
         let file = &mut self.files[file_idx];
         let rendered = file.document.render();
         if rendered == file.last_persisted {
+            file.dirty = false;
             return Ok(());
         }
         let current_mtime = fs::metadata(&file.source_path).ok().and_then(|m| m.modified().ok());
@@ -296,12 +356,60 @@ impl MountState {
         fs::write(&file.source_path, &rendered).map_err(|_| VfsError::Io)?;
         file.last_persisted = rendered;
         file.last_known_mtime = fs::metadata(&file.source_path).ok().and_then(|m| m.modified().ok());
+        file.dirty = false;
         Ok(())
     }
 
     fn rebuild_and_persist(&mut self, file_idx: usize) -> Result<(), VfsError> {
         self.rebuild(file_idx);
         self.persist(file_idx)
+    }
+
+    /// Like [`Self::rebuild_and_persist`], but only marks the file dirty
+    /// instead of writing it to disk immediately — used by `write()` so a
+    /// burst of small writes (a large section split across several NFS
+    /// `WRITE` RPCs) doesn't re-render and rewrite the whole document to
+    /// disk on every single call. A background tick (or the next graceful
+    /// shutdown) calls [`Self::persist`] for real; see [`MqFs::flush`].
+    fn rebuild_and_mark_dirty(&mut self, file_idx: usize) {
+        self.rebuild(file_idx);
+        self.files[file_idx].dirty = true;
+    }
+
+    /// Re-reads a file's source from disk if it changed outside the mount
+    /// and nothing local is pending, so external edits show up without
+    /// requiring an unmount/remount. Never overwrites unsaved local changes:
+    /// those still surface as a `Conflict` the next time they're flushed.
+    fn refresh_if_changed(&mut self, file_idx: usize) {
+        let file = &self.files[file_idx];
+        if file.removed || file.dirty {
+            return;
+        }
+        let Some(mtime) = fs::metadata(&file.source_path).ok().and_then(|m| m.modified().ok()) else {
+            return;
+        };
+        if file.last_known_mtime.is_some_and(|known| mtime <= known) {
+            return;
+        }
+        let Ok(text) = fs::read_to_string(&file.source_path) else {
+            return;
+        };
+        let document = match Document::parse(&text) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    "{} changed on disk but failed to parse ({e}); keeping the previously loaded version",
+                    file.source_path.display()
+                );
+                return;
+            }
+        };
+        let file = &mut self.files[file_idx];
+        file.document = document;
+        file.last_persisted = text;
+        file.last_known_mtime = Some(mtime);
+        tracing::info!("reloaded {} after an external change", file.source_path.display());
+        self.rebuild(file_idx);
     }
 
     fn alloc_ino(&mut self) -> Ino {
@@ -357,7 +465,13 @@ impl MountState {
             .unwrap_or_default()
     }
 
-    fn commit_content(&mut self, file_idx: usize, dir_path: &[String], text: &str) -> Result<(), VfsError> {
+    fn commit_content(
+        &mut self,
+        file_idx: usize,
+        dir_path: &[String],
+        text: &str,
+        defer: bool,
+    ) -> Result<(), VfsError> {
         let Some(range) = self.section_range(file_idx, dir_path) else {
             return Ok(());
         };
@@ -365,22 +479,39 @@ impl MountState {
             .document
             .replace_section_content(range, text)
             .map_err(map_mutation_error)?;
-        self.rebuild_and_persist(file_idx)
+        if defer {
+            self.rebuild_and_mark_dirty(file_idx);
+            Ok(())
+        } else {
+            self.rebuild_and_persist(file_idx)
+        }
     }
 
-    fn commit_frontmatter(&mut self, file_idx: usize, kind: FrontMatterKind, text: &str) -> Result<(), VfsError> {
+    fn commit_frontmatter(
+        &mut self,
+        file_idx: usize,
+        kind: FrontMatterKind,
+        text: &str,
+        defer: bool,
+    ) -> Result<(), VfsError> {
         if let Some((found_kind, idx)) = self.files[file_idx].tree.front_matter
             && found_kind == kind
         {
             self.files[file_idx].document.set_frontmatter(idx, text.to_string());
-            self.rebuild_and_persist(file_idx)?;
+            if defer {
+                self.rebuild_and_mark_dirty(file_idx);
+            } else {
+                self.rebuild_and_persist(file_idx)?;
+            }
         }
         Ok(())
     }
 
-    fn canonical_child(parent_path: &[String], name: &str) -> Option<MountPath> {
+    fn canonical_child(&self, parent_path: &[String], name: &str) -> Option<MountPath> {
         if name == document::CONTENT_FILE {
             Some(MountPath::Content(parent_path.to_vec()))
+        } else if parent_path.is_empty() && self.toc && name == TOC_FILE {
+            Some(MountPath::Toc)
         } else if parent_path.is_empty() {
             frontmatter_kind_for_name(name).map(MountPath::FrontMatter)
         } else {
@@ -400,19 +531,56 @@ impl MountState {
         ino
     }
 
-    fn bytes_for(&self, file_idx: usize, path: &MountPath) -> Result<Vec<u8>, VfsError> {
+    fn toc_bytes(&self, file_idx: usize) -> Vec<u8> {
+        let mut out = String::from("# Table of Contents\n\n");
+        fn walk(sections: &[Section], prefix: &[String], indent: usize, out: &mut String) {
+            for s in sections {
+                let mut path = prefix.to_vec();
+                path.push(s.name.clone());
+                out.push_str(&"  ".repeat(indent));
+                out.push_str(&format!(
+                    "- [{}]({}/{})\n",
+                    s.name,
+                    path.join("/"),
+                    document::CONTENT_FILE
+                ));
+                walk(&s.children, &path, indent + 1, out);
+            }
+        }
+        walk(&self.files[file_idx].tree.root.children, &[], 0, &mut out);
+        out.into_bytes()
+    }
+
+    /// Renders and caches bytes for a content/frontmatter/toc inode, reusing
+    /// the cache populated by an earlier `getattr`/`read`/`readdir` until the
+    /// next `rebuild()` invalidates it.
+    fn content_bytes_cached(&mut self, file_idx: usize, ino: Ino, path: &MountPath) -> Vec<u8> {
+        if let Some(cached) = self.content_cache.get(&ino) {
+            return cached.clone();
+        }
+        let bytes = match path {
+            MountPath::Content(p) => self.section_bytes(file_idx, p),
+            MountPath::FrontMatter(kind) => self.frontmatter_bytes(file_idx, *kind),
+            MountPath::Toc => self.toc_bytes(file_idx),
+            MountPath::Dir(_) => Vec::new(),
+        };
+        self.content_cache.insert(ino, bytes.clone());
+        bytes
+    }
+
+    fn bytes_for(&mut self, file_idx: usize, ino: Ino, path: &MountPath) -> Result<Vec<u8>, VfsError> {
         match path {
-            MountPath::Content(p) => Ok(self.section_bytes(file_idx, p)),
-            MountPath::FrontMatter(kind) => Ok(self.frontmatter_bytes(file_idx, *kind)),
             MountPath::Dir(_) => Err(VfsError::IsDir),
+            _ => Ok(self.content_bytes_cached(file_idx, ino, path)),
         }
     }
 
-    fn commit(&mut self, file_idx: usize, path: &MountPath, text: &str) -> Result<(), VfsError> {
+    fn commit(&mut self, file_idx: usize, path: &MountPath, text: &str, defer: bool) -> Result<(), VfsError> {
         match path {
-            MountPath::Content(p) => self.commit_content(file_idx, p, text),
-            MountPath::FrontMatter(kind) => self.commit_frontmatter(file_idx, *kind, text),
+            MountPath::Content(p) => self.commit_content(file_idx, p, text, defer),
+            MountPath::FrontMatter(kind) => self.commit_frontmatter(file_idx, *kind, text, defer),
             MountPath::Dir(_) => Err(VfsError::IsDir),
+            MountPath::Toc => Err(VfsError::ReadOnly),
         }
     }
 
@@ -424,15 +592,13 @@ impl MountState {
         FileAttr { ino, kind, size, mtime }
     }
 
-    fn attr_for(&self, file_idx: usize, ino: Ino, path: &MountPath) -> FileAttr {
+    fn attr_for(&mut self, file_idx: usize, ino: Ino, path: &MountPath) -> FileAttr {
         match path {
             MountPath::Dir(_) => self.attr(ino, FileKind::Dir, 0),
-            MountPath::Content(p) => self.attr(ino, FileKind::File, self.section_bytes(file_idx, p).len() as u64),
-            MountPath::FrontMatter(kind) => self.attr(
-                ino,
-                FileKind::File,
-                self.frontmatter_bytes(file_idx, *kind).len() as u64,
-            ),
+            _ => {
+                let len = self.content_bytes_cached(file_idx, ino, path).len() as u64;
+                self.attr(ino, FileKind::File, len)
+            }
         }
     }
 }
@@ -490,9 +656,14 @@ pub struct MqFs {
 }
 
 impl MqFs {
-    pub fn new(entries: Vec<(PathBuf, Vec<String>)>, readonly: bool, allow_other: bool) -> std::io::Result<Self> {
+    pub fn new(
+        entries: Vec<(PathBuf, Vec<String>)>,
+        readonly: bool,
+        allow_other: bool,
+        toc: bool,
+    ) -> std::io::Result<Self> {
         Ok(Self {
-            state: Mutex::new(MountState::open(entries, readonly, allow_other)?),
+            state: Mutex::new(MountState::open(entries, readonly, allow_other, toc)?),
         })
     }
 
@@ -505,6 +676,45 @@ impl MqFs {
         match state.add_file(source_path.clone(), mount_path) {
             Ok(()) => tracing::info!("auto-mounted {}", source_path.display()),
             Err(e) => tracing::warn!("failed to auto-mount {}: {e}", source_path.display()),
+        }
+    }
+
+    /// Unmounts a file whose source disappeared or was renamed away while
+    /// `--watch`ing (see [`MountState::remove_file`]); a no-op if it wasn't
+    /// mounted (e.g. a delete event for a file that never parsed).
+    pub fn watch_remove(&self, source_path: &std::path::Path) {
+        let mut state = self.state.lock().unwrap();
+        if state.remove_file(source_path) {
+            tracing::info!("auto-unmounted {}", source_path.display());
+        }
+    }
+
+    /// Persists every mounted file with a deferred (not-yet-written-to-disk)
+    /// change. Called periodically in the background (coalescing bursts of
+    /// `write()` calls into one render+write) and once more at graceful
+    /// shutdown so nothing is lost when the process exits normally.
+    pub fn flush(&self) {
+        let mut state = self.state.lock().unwrap();
+        for idx in 0..state.files.len() {
+            if state.files[idx].removed || !state.files[idx].dirty {
+                continue;
+            }
+            if let Err(e) = state.persist(idx) {
+                tracing::warn!(
+                    "failed to flush pending changes for {}: {e:?}",
+                    state.files[idx].source_path.display()
+                );
+            }
+        }
+    }
+
+    /// Reloads any mounted file that changed on disk outside the mount and
+    /// has no unsaved local edits pending. Called periodically in the
+    /// background alongside [`Self::flush`].
+    pub fn refresh_external(&self) {
+        let mut state = self.state.lock().unwrap();
+        for idx in 0..state.files.len() {
+            state.refresh_if_changed(idx);
         }
     }
 }
@@ -544,7 +754,7 @@ impl MountFs for MqFs {
         }
 
         let (file_idx, parent_path) = state.dir_path(parent).ok_or(VfsError::NotDir)?;
-        let child_path = if let Some(mp) = MountState::canonical_child(&parent_path, name) {
+        let child_path = if let Some(mp) = state.canonical_child(&parent_path, name) {
             mp
         } else if state.has_heading_child(file_idx, &parent_path, name) {
             let mut p = parent_path;
@@ -577,7 +787,7 @@ impl MountFs for MqFs {
     }
 
     fn getattr(&self, ino: Ino) -> Result<FileAttr, VfsError> {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         if let Some(buf) = state.scratch.get(&ino) {
             tracing::debug!("getattr({ino}): scratch, {} bytes", buf.len());
             return Ok(state.attr(ino, FileKind::File, buf.len() as u64));
@@ -603,7 +813,7 @@ impl MountFs for MqFs {
         if let Some(buf) = state.scratch.get_mut(&ino) {
             buf.clear();
         } else if let Some((file_idx, path)) = state.path_for_ino(ino) {
-            state.commit(file_idx, &path, "")?;
+            state.commit(file_idx, &path, "", false)?;
         }
 
         if let Some(buf) = state.scratch.get(&ino) {
@@ -617,12 +827,12 @@ impl MountFs for MqFs {
     }
 
     fn read(&self, ino: Ino, offset: u64, count: u32) -> Result<(Vec<u8>, bool), VfsError> {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let bytes: std::borrow::Cow<[u8]> = if let Some(buf) = state.scratch.get(&ino) {
             std::borrow::Cow::Borrowed(buf)
         } else {
             match state.path_for_ino(ino) {
-                Some((file_idx, path)) => std::borrow::Cow::Owned(state.bytes_for(file_idx, &path)?),
+                Some((file_idx, path)) => std::borrow::Cow::Owned(state.bytes_for(file_idx, ino, &path)?),
                 None => {
                     tracing::debug!("read({ino}): no path for this fileid");
                     return Err(VfsError::NotFound);
@@ -655,9 +865,9 @@ impl MountFs for MqFs {
         }
 
         let (file_idx, path) = state.path_for_ino(ino).ok_or(VfsError::NotFound)?;
-        let mut buf = state.bytes_for(file_idx, &path)?;
+        let mut buf = state.bytes_for(file_idx, ino, &path)?;
         splice(&mut buf, offset, data);
-        state.commit(file_idx, &path, &to_text_lossy(buf))?;
+        state.commit(file_idx, &path, &to_text_lossy(buf), true)?;
         Ok(state.attr_for(file_idx, ino, &path))
     }
 
@@ -668,7 +878,10 @@ impl MountFs for MqFs {
         }
         let (file_idx, parent_path) = state.dir_path(parent).ok_or(VfsError::NotFound)?;
 
-        if let Some(mp) = MountState::canonical_child(&parent_path, name) {
+        if let Some(mp) = state.canonical_child(&parent_path, name) {
+            if matches!(mp, MountPath::Toc) {
+                return Err(VfsError::ReadOnly);
+            }
             let ino = state.files[file_idx].inodes.ino_for(&mp).ok_or(VfsError::Io)?;
             return Ok((ino, state.attr_for(file_idx, ino, &mp)));
         }
@@ -692,7 +905,7 @@ impl MountFs for MqFs {
             super_dir.children.iter().any(|(child_name, _)| child_name == name)
         } else {
             let (file_idx, parent_path) = state.dir_path(parent).ok_or(VfsError::NotFound)?;
-            MountState::canonical_child(&parent_path, name).is_some()
+            state.canonical_child(&parent_path, name).is_some()
                 || state.has_heading_child(file_idx, &parent_path, name)
                 || state.scratch_by_name.contains_key(&(parent, name.to_string()))
         };
@@ -747,12 +960,15 @@ impl MountFs for MqFs {
         let (file_idx, parent_path) = state.dir_path(parent).ok_or(VfsError::NotFound)?;
 
         if name == document::CONTENT_FILE {
-            return state.commit_content(file_idx, &parent_path, "");
+            return state.commit_content(file_idx, &parent_path, "", false);
+        }
+        if parent_path.is_empty() && state.toc && name == TOC_FILE {
+            return Err(VfsError::ReadOnly);
         }
         if parent_path.is_empty()
             && let Some(kind) = frontmatter_kind_for_name(name)
         {
-            return state.commit_frontmatter(file_idx, kind, "");
+            return state.commit_frontmatter(file_idx, kind, "", false);
         }
         let section = state
             .find_child_section(file_idx, &parent_path, name)
@@ -772,9 +988,10 @@ impl MountFs for MqFs {
 
         let (dest_file_idx, new_parent_path) = state.dir_path(to_parent).ok_or(VfsError::NotFound)?;
 
-        let dest_kind = match MountState::canonical_child(&new_parent_path, to_name) {
+        let dest_kind = match state.canonical_child(&new_parent_path, to_name) {
             Some(MountPath::Content(_)) => Some(RenameDest::Content),
             Some(MountPath::FrontMatter(kind)) => Some(RenameDest::FrontMatter(kind)),
+            Some(MountPath::Toc) => return Err(VfsError::ReadOnly),
             _ => None,
         };
 
@@ -801,11 +1018,11 @@ impl MountFs for MqFs {
             let text = to_text_lossy(bytes);
 
             match dest_kind {
-                RenameDest::Content => state.commit_content(dest_file_idx, &new_parent_path, &text)?,
-                RenameDest::FrontMatter(kind) => state.commit_frontmatter(dest_file_idx, kind, &text)?,
+                RenameDest::Content => state.commit_content(dest_file_idx, &new_parent_path, &text, false)?,
+                RenameDest::FrontMatter(kind) => state.commit_frontmatter(dest_file_idx, kind, &text, false)?,
             }
             if let Some(p) = clear_source_path {
-                state.commit_content(dest_file_idx, &p, "")?;
+                state.commit_content(dest_file_idx, &p, "", false)?;
             }
             if let Some(ino) = state.scratch_by_name.remove(&key) {
                 state.scratch.remove(&ino);
@@ -854,7 +1071,7 @@ impl MountFs for MqFs {
     }
 
     fn readdir(&self, ino: Ino, start_after: Ino, max_entries: usize) -> Result<(Vec<DirEntryOwned>, bool), VfsError> {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let mut entries: Vec<DirEntryOwned> = Vec::new();
         let now = SystemTime::now();
 
@@ -876,7 +1093,9 @@ impl MountFs for MqFs {
             .inodes
             .ino_for(&MountPath::Content(path.clone()))
             .unwrap_or(ino);
-        let content_size = state.section_bytes(file_idx, &path).len() as u64;
+        let content_size = state
+            .content_bytes_cached(file_idx, content_ino, &MountPath::Content(path.clone()))
+            .len() as u64;
 
         entries.push(DirEntryOwned {
             ino: content_ino,
@@ -888,11 +1107,25 @@ impl MountFs for MqFs {
             && let Some((kind, _)) = state.files[file_idx].tree.front_matter
             && let Some(fm_ino) = state.files[file_idx].inodes.ino_for(&MountPath::FrontMatter(kind))
         {
-            let size = state.frontmatter_bytes(file_idx, kind).len() as u64;
+            let size = state
+                .content_bytes_cached(file_idx, fm_ino, &MountPath::FrontMatter(kind))
+                .len() as u64;
             entries.push(DirEntryOwned {
                 ino: fm_ino,
                 name: kind.file_name().to_string(),
                 attr: state.attr_at(fm_ino, FileKind::File, size, now),
+            });
+        }
+
+        if path.is_empty()
+            && state.toc
+            && let Some(toc_ino) = state.files[file_idx].inodes.ino_for(&MountPath::Toc)
+        {
+            let size = state.content_bytes_cached(file_idx, toc_ino, &MountPath::Toc).len() as u64;
+            entries.push(DirEntryOwned {
+                ino: toc_ino,
+                name: TOC_FILE.to_string(),
+                attr: state.attr_at(toc_ino, FileKind::File, size, now),
             });
         }
 
@@ -910,6 +1143,10 @@ impl MountFs for MqFs {
 
         Ok(paginate(entries, start_after, max_entries))
     }
+
+    fn flush(&self) {
+        MqFs::flush(self);
+    }
 }
 
 #[cfg(test)]
@@ -924,10 +1161,20 @@ mod tests {
     }
 
     fn mounted_with(content: &str, readonly: bool, allow_other: bool) -> (MqFs, tempfile::TempDir, Ino) {
+        mounted_with_toc(content, readonly, allow_other, false)
+    }
+
+    fn mounted_with_toc(content: &str, readonly: bool, allow_other: bool, toc: bool) -> (MqFs, tempfile::TempDir, Ino) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("doc.md");
         std::fs::write(&path, content).unwrap();
-        let fs = MqFs::new(vec![(path.clone(), vec!["doc".to_string()])], readonly, allow_other).unwrap();
+        let fs = MqFs::new(
+            vec![(path.clone(), vec!["doc".to_string()])],
+            readonly,
+            allow_other,
+            toc,
+        )
+        .unwrap();
         let (entries, _) = fs.readdir(fs.root_ino(), 0, 100).unwrap();
         let file_ino = entries[0].ino;
         (fs, dir, file_ino)
@@ -954,8 +1201,33 @@ mod tests {
         assert_eq!(bytes, b"new body\n");
         assert!(eof);
 
+        // write() defers the disk write (see MqFs::flush) to coalesce bursts
+        // of small writes; flush explicitly to observe it here.
+        fs.flush();
         let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
         assert!(persisted.contains("new body"), "persisted doc was: {persisted}");
+    }
+
+    #[test]
+    fn write_defers_the_disk_write_until_flush() {
+        let (fs, dir, file_ino) = mounted("# Title\n\noriginal\n");
+        let content_ino = lookup_path(&fs, file_ino, &["Title", document::CONTENT_FILE]);
+
+        fs.truncate(content_ino).unwrap();
+        fs.write(content_ino, 0, b"new body\n").unwrap();
+
+        // truncate() persists synchronously (it's the conflict-detection
+        // checkpoint); the write() that follows is deferred and must not
+        // have reached disk yet.
+        let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
+        assert!(
+            !persisted.contains("new body"),
+            "write() must not hit disk before flush"
+        );
+
+        fs.flush();
+        let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
+        assert!(persisted.contains("new body"));
     }
 
     #[test]
@@ -968,6 +1240,7 @@ mod tests {
         fs.truncate(content_ino).unwrap();
         fs.write(content_ino, 0, &bytes).unwrap();
 
+        fs.flush();
         let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
         assert_eq!(persisted, "# Title\n\npara one\n\npara two\n\npara three\n");
     }
@@ -1039,7 +1312,7 @@ mod tests {
         let b = dir.path().join("b.md");
         std::fs::write(&a, "# A\n\n## Sub\n\nbody\n").unwrap();
         std::fs::write(&b, "# B\n\nbody\n").unwrap();
-        let fs = MqFs::new(vec![(a, vec!["a".into()]), (b, vec!["b".into()])], false, false).unwrap();
+        let fs = MqFs::new(vec![(a, vec!["a".into()]), (b, vec!["b".into()])], false, false, false).unwrap();
 
         let a_root = fs.lookup(ROOT_INO, "a").unwrap();
         let a_heading = fs.lookup(a_root, "A").unwrap();
@@ -1178,6 +1451,7 @@ mod tests {
             ],
             false,
             false,
+            false,
         )
         .unwrap();
 
@@ -1213,7 +1487,13 @@ mod tests {
         std::fs::write(&a, "# A\n").unwrap();
         std::fs::write(&b, "# B\n").unwrap();
 
-        let fs = MqFs::new(vec![(a, vec!["doc".into()]), (b, vec!["doc".into()])], false, false).unwrap();
+        let fs = MqFs::new(
+            vec![(a, vec!["doc".into()]), (b, vec!["doc".into()])],
+            false,
+            false,
+            false,
+        )
+        .unwrap();
 
         assert!(fs.lookup(ROOT_INO, "doc").is_ok());
         assert!(fs.lookup(ROOT_INO, "doc-2").is_ok());
@@ -1228,6 +1508,7 @@ mod tests {
         let (bytes, _) = fs.read(fm_ino, 0, 1024).unwrap();
         assert_eq!(bytes, b"key: 2");
 
+        fs.flush();
         let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
         assert!(persisted.contains("key: 2"), "persisted doc was: {persisted}");
     }
@@ -1270,7 +1551,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("docs")).unwrap();
         let a = dir.path().join("docs/a.md");
         std::fs::write(&a, "# A\n").unwrap();
-        let fs = MqFs::new(vec![(a, vec!["docs".into(), "a".into()])], false, false).unwrap();
+        let fs = MqFs::new(vec![(a, vec!["docs".into(), "a".into()])], false, false, false).unwrap();
         let docs_ino_before = fs.lookup(ROOT_INO, "docs").unwrap();
 
         let b = dir.path().join("docs/b.md");
@@ -1296,5 +1577,98 @@ mod tests {
 
         assert!(matches!(fs.lookup(ROOT_INO, "doc-2"), Err(VfsError::NotFound)));
         assert!(fs.lookup(file_ino, "Doc").is_ok());
+    }
+
+    #[test]
+    fn watch_remove_unmounts_a_deleted_file() {
+        let (fs, dir, file_ino) = mounted("# Doc\n\nbody\n");
+        let doc_path = dir.path().join("doc.md");
+
+        fs.watch_remove(&doc_path);
+
+        assert!(matches!(fs.lookup(ROOT_INO, "doc"), Err(VfsError::NotFound)));
+        // The stale inode from before removal no longer resolves either.
+        assert!(matches!(fs.getattr(file_ino), Err(VfsError::NotFound)));
+    }
+
+    #[test]
+    fn watch_remove_is_a_no_op_for_an_unmounted_path() {
+        let (fs, dir, _file_ino) = mounted("# Doc\n\nbody\n");
+        fs.watch_remove(&dir.path().join("never-mounted.md"));
+        assert!(fs.lookup(ROOT_INO, "doc").is_ok());
+    }
+
+    #[test]
+    fn toc_file_lists_the_heading_tree_when_enabled() {
+        let (fs, _dir, file_ino) = mounted_with_toc("# Title\n\nintro\n\n## Sub A\n\na body\n", false, false, true);
+        let toc_ino = fs.lookup(file_ino, TOC_FILE).unwrap();
+        let (bytes, _) = fs.read(toc_ino, 0, 4096).unwrap();
+        let toc = String::from_utf8(bytes).unwrap();
+        assert!(toc.contains("[Title](Title/content.md)"));
+        assert!(toc.contains("[Sub A](Title/Sub A/content.md)"));
+    }
+
+    #[test]
+    fn toc_file_is_absent_without_the_flag() {
+        let (fs, _dir, file_ino) = mounted("# Title\n\nbody\n");
+        assert!(matches!(fs.lookup(file_ino, TOC_FILE), Err(VfsError::NotFound)));
+    }
+
+    #[test]
+    fn toc_file_rejects_writes() {
+        let (fs, _dir, file_ino) = mounted_with_toc("# Title\n\nbody\n", false, false, true);
+        let toc_ino = fs.lookup(file_ino, TOC_FILE).unwrap();
+        assert!(matches!(fs.write(toc_ino, 0, b"x"), Err(VfsError::ReadOnly)));
+        assert!(matches!(fs.remove(file_ino, TOC_FILE), Err(VfsError::ReadOnly)));
+    }
+
+    #[test]
+    fn refresh_external_reloads_an_unedited_file_changed_on_disk() {
+        let (fs, dir, file_ino) = mounted("# Title\n\noriginal\n");
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "# Title\n\nexternally edited\n").unwrap();
+        let future = SystemTime::now() + std::time::Duration::from_secs(3600);
+        std::fs::File::open(&path).unwrap().set_modified(future).unwrap();
+
+        fs.refresh_external();
+
+        let content_ino = lookup_path(&fs, file_ino, &["Title", document::CONTENT_FILE]);
+        let (bytes, _) = fs.read(content_ino, 0, 1024).unwrap();
+        assert_eq!(bytes, b"externally edited\n");
+    }
+
+    #[test]
+    fn refresh_external_does_not_clobber_unsaved_local_edits() {
+        let (fs, dir, file_ino) = mounted("# Title\n\noriginal\n");
+        let content_ino = lookup_path(&fs, file_ino, &["Title", document::CONTENT_FILE]);
+        fs.truncate(content_ino).unwrap();
+        fs.write(content_ino, 0, b"local edit\n").unwrap();
+
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "# Title\n\nexternally edited\n").unwrap();
+        let future = SystemTime::now() + std::time::Duration::from_secs(3600);
+        std::fs::File::open(&path).unwrap().set_modified(future).unwrap();
+
+        fs.refresh_external();
+
+        let (bytes, _) = fs.read(content_ino, 0, 1024).unwrap();
+        assert_eq!(bytes, b"local edit\n", "an unsaved local edit must survive a refresh");
+    }
+
+    #[test]
+    fn readdir_content_size_reflects_an_edit() {
+        let (fs, _dir, file_ino) = mounted("# Title\n\nshort\n");
+        let title_ino = fs.lookup(file_ino, "Title").unwrap();
+        let content_ino = fs.lookup(title_ino, document::CONTENT_FILE).unwrap();
+
+        let (entries, _) = fs.readdir(title_ino, 0, 100).unwrap();
+        let before = entries.iter().find(|e| e.ino == content_ino).unwrap().attr.size;
+
+        fs.truncate(content_ino).unwrap();
+        fs.write(content_ino, 0, b"a much longer body than before\n").unwrap();
+
+        let (entries, _) = fs.readdir(title_ino, 0, 100).unwrap();
+        let after = entries.iter().find(|e| e.ino == content_ino).unwrap().attr.size;
+        assert!(after > before, "cached size must be invalidated by the edit");
     }
 }

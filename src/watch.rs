@@ -1,7 +1,8 @@
-//! `--watch`: recursively watches each mounted *directory* argument for new
-//! `.md` files and mounts them live via [`MqFs::watch_add`], without a
-//! restart. Additions only; applies the same dotfile/dot-directory skip and
-//! `.md`-only filter as the initial directory scan at mount time.
+//! `--watch`: recursively watches each mounted *directory* argument for
+//! `.md` files being added, deleted, or renamed, and mounts/unmounts them
+//! live via [`MqFs::watch_add`]/[`MqFs::watch_remove`], without a restart.
+//! Applies the same dotfile/dot-directory skip, `.md`-only filter, and
+//! `--include`/`--exclude` globs as the initial directory scan at mount time.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,18 +11,32 @@ use std::sync::mpsc;
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 
+use crate::app::glob_allows;
 use crate::fs::MqFs;
 
 /// Starts one watcher thread per `(canonical directory, its base mount-path
 /// prefix)` pair; each runs for the life of the process.
-pub fn spawn_watchers(fs: Arc<MqFs>, roots: Vec<(PathBuf, Vec<String>)>) {
+pub fn spawn_watchers(
+    fs: Arc<MqFs>,
+    roots: Vec<(PathBuf, Vec<String>)>,
+    include: Vec<glob::Pattern>,
+    exclude: Vec<glob::Pattern>,
+) {
     for (root, base_prefix) in roots {
         let fs = Arc::clone(&fs);
-        std::thread::spawn(move || watch_root(fs, root, base_prefix));
+        let include = include.clone();
+        let exclude = exclude.clone();
+        std::thread::spawn(move || watch_root(fs, root, base_prefix, include, exclude));
     }
 }
 
-fn watch_root(fs: Arc<MqFs>, root: PathBuf, base_prefix: Vec<String>) {
+fn watch_root(
+    fs: Arc<MqFs>,
+    root: PathBuf,
+    base_prefix: Vec<String>,
+    include: Vec<glob::Pattern>,
+    exclude: Vec<glob::Pattern>,
+) {
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
     let mut watcher = match notify::recommended_watcher(move |res| {
         let _ = tx.send(res);
@@ -36,31 +51,65 @@ fn watch_root(fs: Arc<MqFs>, root: PathBuf, base_prefix: Vec<String>) {
         tracing::warn!("failed to watch {}: {e}", root.display());
         return;
     }
-    tracing::info!("watching {} for new .md files", root.display());
+    tracing::info!("watching {} for .md file changes", root.display());
 
     for res in rx {
         let Ok(event) = res else { continue };
         if !is_relevant(&event.kind) {
             continue;
         }
+
+        let removed = matches!(
+            event.kind,
+            EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(RenameMode::From))
+        );
+        if removed {
+            for path in &event.paths {
+                fs.watch_remove(path);
+            }
+            continue;
+        }
+
+        if matches!(event.kind, EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            && let [old, new] = event.paths.as_slice()
+        {
+            fs.watch_remove(old);
+            add_if_matched(&fs, &root, &base_prefix, new, &include, &exclude);
+            continue;
+        }
+
         for path in &event.paths {
-            let Some(mount_path) = mount_path_for(&root, &base_prefix, path) else {
-                continue;
-            };
-            let Ok(canonical) = path.canonicalize() else {
-                continue;
-            };
-            fs.watch_add(canonical, mount_path);
+            add_if_matched(&fs, &root, &base_prefix, path, &include, &exclude);
         }
     }
+}
+
+fn add_if_matched(
+    fs: &MqFs,
+    root: &Path,
+    base_prefix: &[String],
+    path: &Path,
+    include: &[glob::Pattern],
+    exclude: &[glob::Pattern],
+) {
+    let Some(mount_path) = mount_path_for(root, base_prefix, path) else {
+        return;
+    };
+    let Ok(rel) = path.strip_prefix(root) else { return };
+    if !glob_allows(rel, include, exclude) {
+        return;
+    }
+    let Ok(canonical) = path.canonicalize() else { return };
+    fs.watch_add(canonical, mount_path);
 }
 
 fn is_relevant(kind: &EventKind) -> bool {
     matches!(
         kind,
         EventKind::Create(_)
+            | EventKind::Remove(_)
             | EventKind::Modify(ModifyKind::Data(_))
-            | EventKind::Modify(ModifyKind::Name(RenameMode::To))
+            | EventKind::Modify(ModifyKind::Name(_))
     )
 }
 
