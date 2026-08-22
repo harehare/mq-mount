@@ -271,7 +271,7 @@ fn is_still_mounted(mountpoint: &Path) -> bool {
     here.dev() != up.dev()
 }
 
-pub fn run<T: MountFs + Send + Sync + 'static>(
+pub fn run<T: MountFs + Send + Sync + Clone + 'static>(
     filesystem: T,
     mountpoint: &Path,
     file_count: usize,
@@ -285,13 +285,16 @@ pub fn run<T: MountFs + Send + Sync + 'static>(
         .block_on(run_mounted(filesystem, mountpoint, file_count, readonly, name))
 }
 
-async fn run_mounted<T: MountFs + Send + Sync + 'static>(
+async fn run_mounted<T: MountFs + Send + Sync + Clone + 'static>(
     filesystem: T,
     mountpoint: &Path,
     file_count: usize,
     readonly: bool,
     name: &str,
 ) -> miette::Result<()> {
+    // Kept aside (not moved into the adapter/listener below) so a graceful
+    // shutdown can flush any not-yet-persisted change; see `MountFs::flush`.
+    let flush_handle = filesystem.clone();
     let mut listener = NFSTcpListener::bind("127.0.0.1:0", NfsAdapter(filesystem))
         .await
         .map_err(|e| miette::miette!("failed to start NFS server: {e}"))?;
@@ -322,6 +325,7 @@ async fn run_mounted<T: MountFs + Send + Sync + 'static>(
         }
     };
 
+    flush_handle.flush();
     if externally_unmounted {
         tracing::info!("unmounted externally; shutting down");
     } else {

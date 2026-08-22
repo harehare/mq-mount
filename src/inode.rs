@@ -17,6 +17,9 @@ pub enum MountPath {
     Dir(Vec<String>),
     Content(Vec<String>),
     FrontMatter(FrontMatterKind),
+    /// The synthetic, read-only `_toc.md` at a mounted file's root, present
+    /// only when the mount was started with `--toc`.
+    Toc,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -30,6 +33,7 @@ struct ShadowNode {
 pub struct InodeTable {
     shadow: ShadowNode,
     frontmatter: Option<(FrontMatterKind, u64)>,
+    toc: Option<u64>,
     path_to_ino: FxHashMap<MountPath, u64>,
     ino_to_path: FxHashMap<u64, MountPath>,
 }
@@ -51,6 +55,7 @@ impl InodeTable {
         Self {
             shadow: ShadowNode::default(),
             frontmatter: None,
+            toc: None,
             path_to_ino: FxHashMap::default(),
             ino_to_path: FxHashMap::default(),
         }
@@ -80,7 +85,7 @@ impl InodeTable {
     /// carrying forward inodes for sections that still exist. `next_ino` is a
     /// counter shared across every mounted file, so inode numbers stay
     /// globally unique across the whole mount.
-    pub fn sync(&mut self, next_ino: &mut u64, tree: &SectionTree) {
+    pub fn sync(&mut self, next_ino: &mut u64, tree: &SectionTree, toc_enabled: bool) {
         self.path_to_ino.clear();
         self.ino_to_path.clear();
 
@@ -113,6 +118,14 @@ impl InodeTable {
                 self.record(MountPath::FrontMatter(kind), ino);
             }
             (None, _) => self.frontmatter = None,
+        }
+
+        if toc_enabled {
+            let ino = self.toc.unwrap_or_else(|| alloc(next_ino));
+            self.toc = Some(ino);
+            self.record(MountPath::Toc, ino);
+        } else {
+            self.toc = None;
         }
     }
 
@@ -189,7 +202,7 @@ mod tests {
     fn synced(table: &mut InodeTable, next_ino: &mut u64, src: &str) -> SectionTree {
         let doc = Document::parse(src).unwrap();
         let tree = doc.tree();
-        table.sync(next_ino, &tree);
+        table.sync(next_ino, &tree, false);
         tree
     }
 

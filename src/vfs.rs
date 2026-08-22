@@ -67,6 +67,10 @@ pub trait MountFs: Send + Sync {
     fn remove(&self, parent: Ino, name: &str) -> Result<(), VfsError>;
     fn rename(&self, from_parent: Ino, from_name: &str, to_parent: Ino, to_name: &str) -> Result<(), VfsError>;
     fn readdir(&self, ino: Ino, start_after: Ino, max_entries: usize) -> Result<(Vec<DirEntryOwned>, bool), VfsError>;
+    /// Persists any not-yet-written-to-disk change. A backend calls this
+    /// once more at graceful shutdown, on top of the periodic background
+    /// call in `main.rs`, so nothing is lost on a clean exit.
+    fn flush(&self);
 }
 
 /// Lets a backend and a background task (e.g. a directory watcher) share one
@@ -139,5 +143,9 @@ impl<T: MountFs + ?Sized> MountFs for std::sync::Arc<T> {
 
     fn readdir(&self, ino: Ino, start_after: Ino, max_entries: usize) -> Result<(Vec<DirEntryOwned>, bool), VfsError> {
         (**self).readdir(ino, start_after, max_entries)
+    }
+
+    fn flush(&self) {
+        (**self).flush();
     }
 }

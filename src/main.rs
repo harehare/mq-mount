@@ -38,14 +38,28 @@ mod app {
         /// Loosen file permission bits so other local users can read/write the mount (the underlying NFS server has no per-caller ACL to restrict access to the mounting user; no effect on Windows)
         #[arg(long)]
         allow_other: bool,
-        /// Auto-mount new .md files added under a mounted directory
+        /// Auto-mount new .md files added under a mounted directory; also
+        /// unmounts a file deleted or renamed away outside the mount
         #[arg(long)]
         watch: bool,
+        /// Expose a read-only `_toc.md` at each mounted file's root, listing
+        /// its whole heading tree with links to each section's content.md
+        #[arg(long)]
+        toc: bool,
+        /// Only mount .md files under a directory argument whose path
+        /// (relative to that argument) matches this glob; repeatable
+        #[arg(long = "include", value_name = "GLOB")]
+        include: Vec<String>,
+        /// Skip .md files under a directory argument whose path (relative to
+        /// that argument) matches this glob; repeatable, applied after
+        /// --include
+        #[arg(long = "exclude", value_name = "GLOB")]
+        exclude: Vec<String>,
         /// Run detached from the terminal; the child keeps running once this process exits
         #[arg(short = 'd', long)]
         background: bool,
         /// Stop a running mount (background or foreground) at this mountpoint and exit
-        #[arg(long, value_name = "MOUNTPOINT", conflicts_with_all = ["paths", "readonly", "allow_other", "watch", "background"])]
+        #[arg(long, value_name = "MOUNTPOINT", conflicts_with_all = ["paths", "readonly", "allow_other", "watch", "toc", "include", "exclude", "background"])]
         stop: Option<PathBuf>,
         /// Enable verbose (debug) logging
         #[arg(short, long)]
@@ -85,7 +99,10 @@ mod app {
             .canonicalize()
             .map_err(|e| miette::miette!("failed to resolve {}: {e}", mountpoint.display()))?;
 
-        let entries = collect_entries(sources)?;
+        let include = compile_globs(&cli.include)?;
+        let exclude = compile_globs(&cli.exclude)?;
+
+        let entries = collect_entries(sources, &include, &exclude)?;
         let entries = entries
             .into_iter()
             .map(|(path, mount_path)| {
@@ -104,12 +121,13 @@ mod app {
         }
 
         let filesystem = Arc::new(
-            MqFs::new(entries, cli.readonly, cli.allow_other)
+            MqFs::new(entries, cli.readonly, cli.allow_other, cli.toc)
                 .map_err(|e| miette::miette!("failed to read source file(s): {e}"))?,
         );
         if !watch_roots.is_empty() {
-            crate::watch::spawn_watchers(Arc::clone(&filesystem), watch_roots);
+            crate::watch::spawn_watchers(Arc::clone(&filesystem), watch_roots, include, exclude);
         }
+        spawn_background_sync(Arc::clone(&filesystem));
 
         let _pidfile = crate::daemon::PidFileGuard::create(mountpoint)
             .map_err(|e| miette::miette!("failed to write pid file: {e}"))?;
@@ -118,6 +136,20 @@ mod app {
         return crate::backend::nfs::run(filesystem, mountpoint, file_count, cli.readonly, &name);
         #[cfg(windows)]
         return crate::backend::winfsp::run(filesystem, mountpoint, file_count, cli.readonly, &name);
+    }
+
+    /// Coalesces bursts of small writes into one render+disk-write per file
+    /// (see [`MqFs::flush`]) and picks up files changed on disk outside the
+    /// mount (see [`MqFs::refresh_external`]), on a short fixed interval for
+    /// the life of the mount.
+    fn spawn_background_sync(fs: Arc<MqFs>) {
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                fs.flush();
+                fs.refresh_external();
+            }
+        });
     }
 
     /// Canonical `(directory, base mount-path prefix)` for every directory
@@ -189,13 +221,37 @@ mod app {
         }
     }
 
-    fn collect_entries(sources: &[PathBuf]) -> miette::Result<Vec<(PathBuf, Vec<String>)>> {
+    /// Compiles `--include`/`--exclude` globs, matched against a `.md`
+    /// file's path relative to the directory argument it was found under.
+    pub(crate) fn compile_globs(patterns: &[String]) -> miette::Result<Vec<glob::Pattern>> {
+        patterns
+            .iter()
+            .map(|p| glob::Pattern::new(p).map_err(|e| miette::miette!("invalid glob {p:?}: {e}")))
+            .collect()
+    }
+
+    /// Whether `rel` (a `.md` file's path relative to the directory argument
+    /// it was found under) passes `--include`/`--exclude`: it must match at
+    /// least one `include` pattern (if any are given), and none of `exclude`.
+    pub(crate) fn glob_allows(rel: &Path, include: &[glob::Pattern], exclude: &[glob::Pattern]) -> bool {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if !include.is_empty() && !include.iter().any(|p| p.matches(&rel_str)) {
+            return false;
+        }
+        !exclude.iter().any(|p| p.matches(&rel_str))
+    }
+
+    fn collect_entries(
+        sources: &[PathBuf],
+        include: &[glob::Pattern],
+        exclude: &[glob::Pattern],
+    ) -> miette::Result<Vec<(PathBuf, Vec<String>)>> {
         let mut out = Vec::new();
         for source in sources {
             if source.is_dir() {
                 let base_name = stem_or_name(source);
                 let mut components = vec![base_name];
-                collect_markdown_files(source, &mut components, &mut out)?;
+                collect_markdown_files(source, source, &mut components, include, exclude, &mut out)?;
             } else if source.is_file() {
                 out.push((source.clone(), vec![stem_or_name(source)]));
             } else {
@@ -217,8 +273,11 @@ mod app {
     }
 
     fn collect_markdown_files(
+        root: &Path,
         dir: &Path,
         components: &mut Vec<String>,
+        include: &[glob::Pattern],
+        exclude: &[glob::Pattern],
         out: &mut Vec<(PathBuf, Vec<String>)>,
     ) -> miette::Result<()> {
         let mut entries: Vec<_> = fs::read_dir(dir)
@@ -239,15 +298,63 @@ mod app {
                 .map_err(|e| miette::miette!("failed to stat {}: {e}", path.display()))?;
             if file_type.is_dir() {
                 components.push(name.to_string());
-                collect_markdown_files(&path, components, out)?;
+                collect_markdown_files(root, &path, components, include, exclude, out)?;
                 components.pop();
             } else if file_type.is_file() && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("md")) {
+                let rel = path.strip_prefix(root).unwrap_or(&path);
+                if !glob_allows(rel, include, exclude) {
+                    continue;
+                }
                 let mut mount_path = components.clone();
                 mount_path.push(stem_or_name(&path));
                 out.push((path, mount_path));
             }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn glob_allows_matches_only_included_patterns() {
+            let include = compile_globs(&["guide/*.md".to_string()]).unwrap();
+            assert!(glob_allows(Path::new("guide/a.md"), &include, &[]));
+            assert!(!glob_allows(Path::new("api/a.md"), &include, &[]));
+        }
+
+        #[test]
+        fn glob_allows_applies_exclude_after_include() {
+            let include = compile_globs(&["**/*.md".to_string()]).unwrap();
+            let exclude = compile_globs(&["**/draft-*.md".to_string()]).unwrap();
+            assert!(glob_allows(Path::new("guide/a.md"), &include, &exclude));
+            assert!(!glob_allows(Path::new("guide/draft-a.md"), &include, &exclude));
+        }
+
+        #[test]
+        fn glob_allows_with_no_include_patterns_allows_everything_but_excludes() {
+            let exclude = compile_globs(&["*.tmp.md".to_string()]).unwrap();
+            assert!(glob_allows(Path::new("a.md"), &[], &exclude));
+            assert!(!glob_allows(Path::new("a.tmp.md"), &[], &exclude));
+        }
+
+        #[test]
+        fn collect_entries_applies_include_and_exclude_under_a_directory_argument() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("guide")).unwrap();
+            std::fs::create_dir_all(dir.path().join("api")).unwrap();
+            std::fs::write(dir.path().join("guide/a.md"), "# A\n").unwrap();
+            std::fs::write(dir.path().join("guide/draft-b.md"), "# B\n").unwrap();
+            std::fs::write(dir.path().join("api/c.md"), "# C\n").unwrap();
+
+            let include = compile_globs(&["guide/*.md".to_string()]).unwrap();
+            let exclude = compile_globs(&["guide/draft-*.md".to_string()]).unwrap();
+            let entries = collect_entries(&[dir.path().to_path_buf()], &include, &exclude).unwrap();
+
+            let names: Vec<String> = entries.iter().map(|(p, _)| stem_or_name(p)).collect();
+            assert_eq!(names, vec!["a"]);
+        }
     }
 }
 

@@ -305,7 +305,7 @@ impl<T: MountFs> FileSystemContext for WinFspAdapter<T> {
     }
 }
 
-pub fn run<T: MountFs + Send + Sync + 'static>(
+pub fn run<T: MountFs + Send + Sync + Clone + 'static>(
     filesystem: T,
     mountpoint: &Path,
     file_count: usize,
@@ -314,6 +314,11 @@ pub fn run<T: MountFs + Send + Sync + 'static>(
 ) -> miette::Result<()> {
     let init = winfsp::winfsp_init().map_err(|e| miette::miette!("failed to initialize WinFSP: {e:?}"))?;
 
+    // Kept aside (not moved into the started host below) so a graceful stop
+    // can flush any not-yet-persisted change; see `MountFs::flush`. Not
+    // reached by `--stop`, which terminates the process directly on Windows
+    // (see README's Known limitations) — only Ctrl-C/service-stop.
+    let flush_handle = filesystem.clone();
     let filesystem = std::sync::Mutex::new(Some(filesystem));
     let mountpoint_owned = mountpoint.to_path_buf();
     let filesystem_name = name.to_string();
@@ -345,7 +350,8 @@ pub fn run<T: MountFs + Send + Sync + 'static>(
             host.start()?;
             Ok(host)
         })
-        .with_stop(|host| {
+        .with_stop(move |host| {
+            flush_handle.flush();
             if let Some(host) = host {
                 host.stop();
             }
