@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/logo.svg" style="width: 128px; height: 128px;"/>
+  <img src="assets/logo.svg" width="128" height="128" alt="mq-mount logo"/>
 
 <h1>mq-mount</h1>
 
