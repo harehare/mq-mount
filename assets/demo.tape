@@ -26,7 +26,7 @@ Type@1ms "clear" Enter
 Sleep 500ms
 Show
 
-Type "mq-mount notes.md mnt -d"
+Type "mq-mount notes.md mnt -d --write"
 Enter
 Sleep 2s
 

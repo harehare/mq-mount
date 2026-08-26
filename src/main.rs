@@ -32,9 +32,9 @@ mod app {
         /// Markdown files and/or directories to mount, followed by the mount directory as the last argument (e.g. `a.md docs/ /mnt`). Omit when using `--stop`.
         #[arg(num_args = 0..)]
         paths: Vec<PathBuf>,
-        /// Mount read-only; all writes are rejected
+        /// Allow writes to the source Markdown file(s) (default: read-only)
         #[arg(long)]
-        readonly: bool,
+        write: bool,
         /// Loosen file permission bits so other local users can read/write the mount (the underlying NFS server has no per-caller ACL to restrict access to the mounting user; no effect on Windows)
         #[arg(long)]
         allow_other: bool,
@@ -59,7 +59,7 @@ mod app {
         #[arg(short = 'd', long)]
         background: bool,
         /// Stop a running mount (background or foreground) at this mountpoint and exit
-        #[arg(long, value_name = "MOUNTPOINT", conflicts_with_all = ["paths", "readonly", "allow_other", "watch", "toc", "include", "exclude", "background"])]
+        #[arg(long, value_name = "MOUNTPOINT", conflicts_with_all = ["paths", "write", "allow_other", "watch", "toc", "include", "exclude", "background"])]
         stop: Option<PathBuf>,
         /// Enable verbose (debug) logging
         #[arg(short, long)]
@@ -99,6 +99,8 @@ mod app {
             .canonicalize()
             .map_err(|e| miette::miette!("failed to resolve {}: {e}", mountpoint.display()))?;
 
+        let readonly = !cli.write;
+
         let include = compile_globs(&cli.include)?;
         let exclude = compile_globs(&cli.exclude)?;
 
@@ -121,7 +123,7 @@ mod app {
         }
 
         let filesystem = Arc::new(
-            MqFs::new(entries, cli.readonly, cli.allow_other, cli.toc)
+            MqFs::new(entries, readonly, cli.allow_other, cli.toc)
                 .map_err(|e| miette::miette!("failed to read source file(s): {e}"))?,
         );
         if !watch_roots.is_empty() {
@@ -133,9 +135,9 @@ mod app {
             .map_err(|e| miette::miette!("failed to write pid file: {e}"))?;
 
         #[cfg(unix)]
-        return crate::backend::nfs::run(filesystem, mountpoint, file_count, cli.readonly, &name);
+        return crate::backend::nfs::run(filesystem, mountpoint, file_count, readonly, &name);
         #[cfg(windows)]
-        return crate::backend::winfsp::run(filesystem, mountpoint, file_count, cli.readonly, &name);
+        return crate::backend::winfsp::run(filesystem, mountpoint, file_count, readonly, &name);
     }
 
     /// Coalesces bursts of small writes into one render+disk-write per file
