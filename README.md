@@ -38,39 +38,42 @@ front matter
 ---                       ->  /a/_frontmatter.yaml (or _frontmatter.toml)
 ```
 
-With `--toc`, every mounted file also gets a read-only `/a/_toc.md` listing its whole heading tree as a linked Markdown list (e.g. `- [Sub A](Title/Sub A/content.md)`), so an agent can see a document's structure in one read instead of walking every directory with `ls`.
-
-A section's `content.md` holds only its own body: text up to the *next* heading of any depth, not its subsections' content. Nesting comes from heading depth and document order, not from any indentation convention; a `#` typed inside a deeply-nested section's `content.md` becomes a new top-level directory *within that file* on save, not a nested one.
-
-The directories mirroring the command-line arguments (the top-level per-file directories, and any intermediate directories contributed by a directory argument) are fixed at mount time: `mkdir`/`rmdir`/`rename` at that level (or moving `content.md` between two different mounted files) are not supported (`EPERM`/`ENOENT`/`EOPNOTSUPP`).
+- With `--toc`, every mounted file also gets a read-only `/a/_toc.md`: a linked Markdown list of its whole heading tree (e.g. `- [Sub A](Title/Sub A/content.md)`). Lets an agent see the structure in one read instead of walking every directory with `ls`.
+- A section's `content.md` holds only its own body — text up to the *next* heading of any depth, not its subsections'.
+- Nesting follows heading depth and document order, not indentation. Typing `#` inside a deeply-nested section's `content.md` creates a new top-level directory *within that file* on save, not a nested one.
+- The top-level, per-file/per-directory layout is fixed at mount time: `mkdir`/`rmdir`/`rename` there, or moving `content.md` between two mounted files, aren't supported (`EPERM`/`ENOENT`/`EOPNOTSUPP`).
 
 ## Read/write semantics
 
-- Editing `content.md` and saving splices the new text into the in-memory document immediately — reads through the mount (including a new heading line becoming a subdirectory on the next `ls`) always see it right away. The write-through to the *source file on disk* is coalesced: a burst of small writes (e.g. an editor or NFS client splitting a large save into several `write()` calls) is batched into a single render-and-write, flushed within ~150ms or at the next operation, and always flushed before a graceful unmount/Ctrl-C. `_toc.md`, if enabled, is always computed fresh and is never stale.
-- `mkdir NAME` under a directory adds a new (empty) subheading. Fails with `EEXIST` if a sibling already has that name.
-- `rmdir` is POSIX-strict: it only removes an already-empty directory (no subdirectories, empty `content.md`). Plain `rm -r somedir` still deletes a whole section and everything nested inside it, since the shell already unlinks/rmdirs bottom-up.
-- Renaming a directory renames the heading's title. Moving a directory to a *different* parent within the same mounted file reparents the heading (and everything nested under it) there, renumbering its heading depth — and its descendants' — to fit; it's rejected (`EINVAL`) if that would nest a heading past level 6, the deepest Markdown headings go, or if the destination is inside the directory's own subtree. Reparenting across two different mounted files, and moving/renaming the top-level, per-file directories themselves, are still not supported (`EOPNOTSUPP`/`EPERM`/`ENOENT`); the set of mounted files is fixed for the life of the mount.
-- Editors that save via a temp-file-then-rename dance (common with vim's `backupcopy=auto`, VS Code, and other "atomic save" tools) are supported: renaming any file onto a canonical `content.md`/frontmatter path adopts its bytes as that section's new content.
+- Mounts are read-only by default; pass `--write` to allow edits to reach the source file(s).
+- Saving `content.md` updates the in-memory document immediately (reads see it right away, e.g. a new heading becomes a subdirectory on the next `ls`). The write to disk is batched — flushed within ~150ms, or before unmount/Ctrl-C.
+- `_toc.md` is always computed fresh, never stale.
+- `mkdir NAME` adds an empty subheading. Fails with `EEXIST` if a sibling already has that name.
+- `rmdir` is POSIX-strict: only an already-empty directory (no subdirectories, empty `content.md`) can be removed. `rm -r` still deletes a whole section, since the shell unlinks bottom-up.
+- Renaming a directory renames the heading. Moving it to a different parent in the same mounted file reparents the heading and its subtree, adjusting heading depth to fit.
+  - Rejected (`EINVAL`) if that would nest past depth 6, or move a directory into its own subtree.
+  - Reparenting across two mounted files, and moving/renaming the top-level per-file directories, aren't supported (`EOPNOTSUPP`/`EPERM`/`ENOENT`) — the set of mounted files is fixed for the mount's life.
+- Atomic-save editors (vim `backupcopy=auto`, VS Code, etc.) work: renaming a file onto a canonical `content.md`/frontmatter path adopts its bytes as the new content.
 
 ## Use cases
 
-- **Token-efficient reading for LLM agents.** An agent working against a large Markdown doc (a spec, a design doc, a long README) doesn't need to load the whole file into context: `grep -r` the mount to find the relevant heading, then `cat` just that section's `content.md`. `ls` at each level doubles as a table of contents, so the agent can also walk down to the right section without ever reading unrelated ones.
-- **Section-scoped edits.** An agent (or a script) can rewrite one section's `content.md` in isolation — no need to fetch the whole document, locate the section by string/regex matching, splice in new text, and write the whole thing back; `mq-mount` does that splice on save.
-- **Ad-hoc exploration with standard tools.** `find`, `grep`, `fzf`, and any text editor work against the mount as-is, which is useful for skimming or searching through a document's structure without a Markdown-aware parser on hand.
+- **Token-efficient reading for LLM agents.** Don't load a whole doc into context — `grep -r` the mount to find a heading, then `cat` just that section's `content.md`. `ls` at each level doubles as a table of contents.
+- **Section-scoped edits.** Rewrite one section's `content.md` in isolation; `mq-mount` splices it back into the full document on save.
+- **Ad-hoc exploration.** `find`, `grep`, `fzf`, and any text editor work against the mount as-is — no Markdown-aware parser needed.
 
 ## Known limitations
 
-- **Not byte-exact.** Every flush re-renders the *whole* document through mq-markdown. Mounting a file and saving without any edits can still normalize whitespace, blank-line counts, list markers, and table padding; mq-markdown's renderer doesn't guarantee a byte-identical round trip. mq-mount skips the rewrite when the render is unchanged from what it last wrote, to avoid *spurious* rewrites, but a first save after mount may differ from the original bytes even with no logical edit.
-- **External changes are auto-reloaded, not merged.** If a source file's mtime advances outside the mount while mounted and there's no unsaved local edit pending, the next background tick (~150ms) transparently re-reads it — no unmount/remount needed. If a local edit *is* pending, the mount refuses to overwrite the external change instead of silently discarding either version (`ESTALE`/`STATUS_FILE_LOCK_CONFLICT`); there's still no diff/merge, so unmount and remount to reconcile by hand.
-- **A deferred write can be lost on a hard kill.** Since a burst of writes is batched (see Read/write semantics) rather than hitting disk on every `write()` call, a crash, `kill -9`, power loss, or (on Windows) `--stop`'s forced process termination can lose up to the last ~150ms of unflushed edits. A graceful stop (Ctrl-C, SIGTERM, or `--stop` on macOS/Linux) always flushes first.
-- **Background mounts notice an external unmount within a couple of seconds, not instantly.** macOS/Linux poll for that every 2s. On Windows, `--stop` has no graceful cross-process signal to send, so it forcibly terminates the process; WinFSP's driver still unmounts cleanly when its hosting process dies, same as the README already notes for Ctrl-C.
-- **The Windows (WinFSP) backend is unverified.** It's written against WinFSP's documented API and an example filesystem from its own repository, but hasn't yet been built or run on an actual Windows machine — see [Installation](#installation).
+- **Not byte-exact.** Every flush re-renders the whole document, which can normalize whitespace, blank lines, list markers, and table padding. mq-mount skips the rewrite when the render is unchanged, but the first save after mount may still differ from the original bytes even with no logical edit.
+- **External changes are auto-reloaded, not merged.** An external edit is picked up on the next tick (~150ms) if there's no pending local edit. If there is, the mount refuses to overwrite it (`ESTALE`/`STATUS_FILE_LOCK_CONFLICT`) instead of silently discarding either version — unmount and remount to reconcile by hand.
+- **A deferred write can be lost on a hard kill.** Writes are batched rather than flushed on every `write()`; a crash, `kill -9`, or forced termination can lose up to ~150ms of unflushed edits. A graceful stop (Ctrl-C, SIGTERM, `--stop`) always flushes first.
+- **External unmounts are noticed within a couple of seconds, not instantly.** macOS/Linux poll every 2s. On Windows, `--stop` forcibly terminates the process (no graceful cross-process signal); WinFSP still unmounts cleanly when its host process dies.
+- **The Windows (WinFSP) backend is unverified.** Built against WinFSP's documented API, but not yet run on a real Windows machine — see [Installation](#installation).
 
 ## Installation
 
-**macOS/Linux**: no system packages are required; mounting uses the OS's built-in NFS client.
+**macOS/Linux**: no system packages required; mounting uses the OS's built-in NFS client.
 
-**Windows**: install [WinFSP](https://winfsp.dev) first (a separate driver, like macFUSE on macOS — there's no lighter-weight option, since Windows' own built-in NFS client is gated to Pro/Enterprise/Server editions and doesn't support the custom ports this tool needs). This backend hasn't been verified on a real Windows machine yet; see [Known limitations](#known-limitations).
+**Windows**: install [WinFSP](https://winfsp.dev) first — Windows' own built-in NFS client is Pro/Enterprise/Server-only and doesn't support the custom ports this tool needs. Backend unverified on a real Windows machine; see [Known limitations](#known-limitations).
 
 ### Install script
 
@@ -78,7 +81,7 @@ The directories mirroring the command-line arguments (the top-level per-file dir
 curl -fsSL https://raw.githubusercontent.com/harehare/mq-mount/main/bin/install.sh | bash
 ```
 
-Downloads the latest release for your OS/architecture into `~/.local/bin`, verifying it against the release's checksums file. Pass `--bin-dir <dir>` to install elsewhere or `--no-modify-path` to skip touching your shell profile; see `--help` for details.
+Installs the latest release for your OS/architecture into `~/.local/bin`, verified against the release's checksums. `--bin-dir <dir>` to install elsewhere, `--no-modify-path` to skip touching your shell profile; see `--help` for details.
 
 ### cargo-binstall
 
@@ -98,15 +101,16 @@ cd mq-mount
 cargo build --release
 ```
 
-The `mount` feature is enabled by default. Building without it (`cargo build --no-default-features`) still compiles and tests the core section-tree logic, but produces a binary that refuses to run.
+`mount` is a default feature. Without it (`cargo build --no-default-features`), the core section-tree logic still builds and tests, but the binary refuses to run.
 
 ## Usage
 
 ```sh
 mkdir /tmp/doc-mount
-mq-mount README.md CHANGELOG.md /tmp/doc-mount
+# Mounts are read-only by default; pass --write to edit the source file(s).
+mq-mount README.md CHANGELOG.md /tmp/doc-mount --write
 # or mount every .md file under a directory tree, structure mirrored:
-mq-mount docs/ /tmp/doc-mount
+mq-mount docs/ /tmp/doc-mount --write
 
 ls /tmp/doc-mount
 cat /tmp/doc-mount/README/Installation/content.md
@@ -149,7 +153,8 @@ Arguments:
               Omit when using `--stop`
 
 Options:
-      --readonly           Mount read-only; all writes are rejected
+      --write              Allow writes to the source Markdown file(s)
+                            (default: read-only)
       --allow-other        Loosen file permission bits so other local users
                             can read/write the mount (the underlying NFS
                             server has no per-caller ACL to restrict access
