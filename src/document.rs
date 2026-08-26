@@ -261,8 +261,7 @@ impl Document {
             .parse::<Markdown>()
             .map_err(|e| MutationError::Parse(e.to_string()))?
             .nodes;
-        self.markdown.nodes.splice(range, new_nodes);
-        self.renumber_top_level_positions();
+        self.splice_with_reflow(range, new_nodes);
         Ok(())
     }
 
@@ -278,23 +277,81 @@ impl Document {
             })],
             position: None,
         });
-        self.markdown.nodes.insert(parent.own_content_range.end, heading);
-        self.renumber_top_level_positions();
+        let at = parent.own_content_range.end;
+        self.splice_with_reflow(at..at, vec![heading]);
         Ok(())
     }
 
-    /// Spaces every top-level node's own position 2 lines apart so the
-    /// renderer always puts exactly one blank line between them; a `None`
-    /// position (every spliced/inserted node) collapses that to no blank
-    /// line at all.
-    fn renumber_top_level_positions(&mut self) {
-        let mut line = 1usize;
-        for node in &mut self.markdown.nodes {
-            node.set_position(Some(Position {
-                start: Point { line, column: 1 },
-                end: Point { line, column: 1 },
-            }));
-            line += 2;
+    /// Splices `new_nodes` into `range`, touching line positions only at the
+    /// two seams (old content <-> `new_nodes` <-> old content) instead of
+    /// renumbering the whole document — mq-markdown infers list/table/
+    /// paragraph grouping from position gaps, so a blanket renumbering
+    /// corrupts those anywhere in the document, not just the edited range.
+    fn splice_with_reflow(&mut self, range: Range<usize>, mut new_nodes: Vec<Node>) -> Vec<Node> {
+        // Hand-built nodes (e.g. `insert_heading`'s new `Heading`) have no
+        // position; give them one so the shift below has something to use.
+        Self::normalize_missing_positions(&mut new_nodes);
+
+        let left_end_line = range
+            .start
+            .checked_sub(1)
+            .and_then(|i| self.markdown.nodes.get(i))
+            .and_then(Node::position)
+            .map(|p| p.end.line);
+
+        if let Some(first_line) = new_nodes.first().and_then(Node::position).map(|p| p.start.line) {
+            let target = left_end_line.map_or(1, |l| l + 2);
+            Self::shift_top_level_positions(&mut new_nodes, target as isize - first_line as isize);
+        }
+
+        let anchor_line = new_nodes
+            .last()
+            .and_then(Node::position)
+            .map(|p| p.end.line)
+            .or(left_end_line);
+
+        if let Some(anchor) = anchor_line
+            && let Some(next_start) = self
+                .markdown
+                .nodes
+                .get(range.end)
+                .and_then(Node::position)
+                .map(|p| p.start.line)
+        {
+            let target = anchor + 2;
+            Self::shift_top_level_positions(
+                &mut self.markdown.nodes[range.end..],
+                target as isize - next_start as isize,
+            );
+        }
+
+        self.markdown.nodes.splice(range, new_nodes).collect()
+    }
+
+    fn normalize_missing_positions(nodes: &mut [Node]) {
+        let mut prev_end_line: Option<usize> = None;
+        for node in nodes {
+            if node.position().is_none() {
+                let line = prev_end_line.map_or(1, |l| l + 2);
+                node.set_position(Some(Position {
+                    start: Point { line, column: 1 },
+                    end: Point { line, column: 1 },
+                }));
+            }
+            prev_end_line = node.position().map(|p| p.end.line);
+        }
+    }
+
+    fn shift_top_level_positions(nodes: &mut [Node], delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        for node in nodes {
+            if let Some(mut pos) = node.position() {
+                pos.start.line = pos.start.line.saturating_add_signed(delta);
+                pos.end.line = pos.end.line.saturating_add_signed(delta);
+                node.set_position(Some(pos));
+            }
         }
     }
 
@@ -314,8 +371,7 @@ impl Document {
             return Err(MutationError::NotEmpty);
         }
         let idx = section.heading_index.ok_or(MutationError::NotADirectory)?;
-        self.markdown.nodes.remove(idx);
-        self.renumber_top_level_positions();
+        self.splice_with_reflow(idx..idx + 1, Vec::new());
         Ok(())
     }
 
@@ -342,7 +398,7 @@ impl Document {
             return Err(MutationError::TooDeep);
         }
 
-        let mut moved: Vec<Node> = self.markdown.nodes.drain(start..end).collect();
+        let mut moved = self.splice_with_reflow(start..end, Vec::new());
         for node in &mut moved {
             if let Node::Heading(h) = node {
                 h.depth = (h.depth as i16 + depth_shift) as u8;
@@ -361,8 +417,7 @@ impl Document {
         } else {
             new_parent.own_content_range.end - removed_len
         };
-        self.markdown.nodes.splice(insert_at..insert_at, moved);
-        self.renumber_top_level_positions();
+        self.splice_with_reflow(insert_at..insert_at, moved);
         Ok(())
     }
 }
@@ -371,6 +426,46 @@ impl Document {
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    #[test]
+    fn insert_heading_keeps_tight_reference_definitions_tight() {
+        let mut doc = Document::parse("# A\n\n[a]: http://a\n[b]: http://b\n[c]: http://c\n\n# B\n").unwrap();
+        let tree = doc.tree();
+        let a = tree.find(&["A"]).unwrap();
+        doc.insert_heading(a, "New").unwrap();
+        assert_eq!(
+            doc.render(),
+            "# A\n\n[a]: http://a\n[b]: http://b\n[c]: http://c\n\n## New\n\n# B\n"
+        );
+    }
+
+    #[test]
+    fn insert_heading_keeps_a_formatted_paragraph_as_one_paragraph() {
+        // mq-markdown stores each inline run (plain text, bold, link, ...) of
+        // one paragraph as its own flat top-level node; an edit elsewhere in
+        // the document must not blow them apart into separate paragraphs.
+        let mut doc = Document::parse("# A\n\nHello **bold** and [a link](http://x) here.\n\n# B\n").unwrap();
+        let tree = doc.tree();
+        let a = tree.find(&["A"]).unwrap();
+        doc.insert_heading(a, "New").unwrap();
+        assert_eq!(
+            doc.render(),
+            "# A\n\nHello **bold** and [a link](http://x) here.\n\n## New\n\n# B\n"
+        );
+    }
+
+    #[test]
+    fn replace_section_content_leaves_an_unrelated_sections_list_and_formatting_intact() {
+        let mut doc = Document::parse("# A\n\nHello **bold** [x](http://x).\n\n- a\n- b\n\n# B\n\nold\n").unwrap();
+        let tree = doc.tree();
+        let b = tree.find(&["B"]).unwrap();
+        doc.replace_section_content(b.own_content_range.clone(), "new\n")
+            .unwrap();
+        assert_eq!(
+            doc.render(),
+            "# A\n\nHello **bold** [x](http://x).\n\n- a\n- b\n\n# B\n\nnew\n"
+        );
+    }
 
     #[test]
     fn replace_section_content_preserves_the_blank_line_after_the_heading() {
@@ -382,6 +477,30 @@ mod tests {
         doc.replace_section_content(title.own_content_range.clone(), &body)
             .unwrap();
         assert_eq!(doc.render(), "# Title\n\nline1\nline2\nline3\n");
+    }
+
+    #[test]
+    fn replace_section_content_keeps_a_tight_list_tight_after_appending_an_item() {
+        let mut doc = Document::parse("# Ideas\n\n- ship the watch mode\n\n# Todo\n\n- record a demo\n").unwrap();
+        let tree = doc.tree();
+        let ideas = tree.find(&["Ideas"]).unwrap();
+        let mut body = doc.render_range(ideas.own_content_range.clone());
+        body.push_str("- also ship the demo gif\n");
+        doc.replace_section_content(ideas.own_content_range.clone(), &body)
+            .unwrap();
+        assert_eq!(
+            doc.render(),
+            "# Ideas\n\n- ship the watch mode\n- also ship the demo gif\n\n# Todo\n\n- record a demo\n"
+        );
+    }
+
+    #[test]
+    fn insert_heading_keeps_a_nested_list_intact() {
+        let mut doc = Document::parse("# Title\n\n- a\n  - a1\n  - a2\n- b\n").unwrap();
+        let tree = doc.tree();
+        let title = tree.find(&["Title"]).unwrap();
+        doc.insert_heading(title, "New").unwrap();
+        assert_eq!(doc.render(), "# Title\n\n- a\n  - a1\n  - a2\n- b\n\n## New\n");
     }
 
     #[test]
@@ -482,6 +601,16 @@ mod tests {
         assert!(tree.find(&["Title", "Renamed"]).is_none());
         assert!(doc.render().contains("# Title"));
         assert!(!doc.render().contains("Renamed"));
+    }
+
+    #[test]
+    fn move_heading_keeps_a_tight_list_in_the_moved_subtree_tight() {
+        let mut doc = Document::parse("# A\n\n## B\n\n- a\n- b\n\n# D\n\nd\n").unwrap();
+        let tree = doc.tree();
+        let b = tree.find(&["A", "B"]).unwrap();
+        let d = tree.find(&["D"]).unwrap();
+        doc.move_heading(b, d, "Moved").unwrap();
+        assert_eq!(doc.render(), "# A\n\n# D\n\nd\n\n## Moved\n\n- a\n- b\n");
     }
 
     #[test]
