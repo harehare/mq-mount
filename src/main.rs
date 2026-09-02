@@ -10,6 +10,9 @@ mod backend;
 mod daemon;
 
 #[cfg(feature = "mount")]
+mod query_filter;
+
+#[cfg(feature = "mount")]
 mod watch;
 
 #[cfg(feature = "mount")]
@@ -55,12 +58,25 @@ mod app {
         /// --include
         #[arg(long = "exclude", value_name = "GLOB")]
         exclude: Vec<String>,
+        /// Only expose sections whose heading matches this mq query (e.g.
+        /// `.h1`, `select(contains("TODO"))`); ancestors of a match stay
+        /// visible so it remains reachable by path. Always mounts
+        /// read-only, regardless of --write
+        #[arg(long, value_name = "QUERY")]
+        filter: Option<String>,
+        /// Before the first write to each source file, save its pre-edit
+        /// bytes to a sibling `<file>.orig` (skipped if one already exists)
+        #[arg(long)]
+        backup: bool,
         /// Run detached from the terminal; the child keeps running once this process exits
         #[arg(short = 'd', long)]
         background: bool,
         /// Stop a running mount (background or foreground) at this mountpoint and exit
-        #[arg(long, value_name = "MOUNTPOINT", conflicts_with_all = ["paths", "write", "allow_other", "watch", "toc", "include", "exclude", "background"])]
+        #[arg(long, value_name = "MOUNTPOINT", conflicts_with_all = ["paths", "write", "allow_other", "watch", "toc", "include", "exclude", "filter", "backup", "background", "list"])]
         stop: Option<PathBuf>,
+        /// List currently running background mounts and exit
+        #[arg(long, conflicts_with_all = ["paths", "write", "allow_other", "watch", "toc", "include", "exclude", "filter", "backup", "background", "stop"])]
+        list: bool,
         /// Enable verbose (debug) logging
         #[arg(short, long)]
         verbose: bool,
@@ -76,6 +92,10 @@ mod app {
 
         if let Some(mountpoint) = &cli.stop {
             return crate::daemon::stop(mountpoint);
+        }
+
+        if cli.list {
+            return crate::daemon::list();
         }
 
         if cli.paths.len() < 2 {
@@ -99,7 +119,11 @@ mod app {
             .canonicalize()
             .map_err(|e| miette::miette!("failed to resolve {}: {e}", mountpoint.display()))?;
 
-        let readonly = !cli.write;
+        let readonly = effective_readonly(cli.write, cli.filter.is_some());
+        if cli.write && cli.filter.is_some() {
+            tracing::warn!("--filter always mounts read-only; ignoring --write");
+        }
+        let heading_filter = cli.filter.as_deref().map(crate::query_filter::compile).transpose()?;
 
         let include = compile_globs(&cli.include)?;
         let exclude = compile_globs(&cli.exclude)?;
@@ -123,7 +147,7 @@ mod app {
         }
 
         let filesystem = Arc::new(
-            MqFs::new(entries, readonly, cli.allow_other, cli.toc)
+            MqFs::new(entries, readonly, cli.allow_other, cli.toc, cli.backup, heading_filter)
                 .map_err(|e| miette::miette!("failed to read source file(s): {e}"))?,
         );
         if !watch_roots.is_empty() {
@@ -166,7 +190,7 @@ mod app {
             .filter(|s| s.is_dir())
             .map(|s| {
                 s.canonicalize()
-                    .map(|resolved| (resolved, vec![stem_or_name(s)]))
+                    .map(|resolved| (resolved, vec![dir_base_name(s)]))
                     .map_err(|e| miette::miette!("failed to resolve {}: {e}", s.display()))
             })
             .collect::<miette::Result<Vec<_>>>()?;
@@ -223,6 +247,15 @@ mod app {
         }
     }
 
+    /// A `--filter`ed mount is always read-only: writing into a document
+    /// whose non-matching sections are hidden from the mount is out of
+    /// scope (there'd be no way to splice an edit back in among content the
+    /// mount never showed), so `--filter` overrides `--write` rather than
+    /// conflicting with it.
+    fn effective_readonly(write: bool, filtered: bool) -> bool {
+        !write || filtered
+    }
+
     /// Compiles `--include`/`--exclude` globs, matched against a `.md`
     /// file's path relative to the directory argument it was found under.
     pub(crate) fn compile_globs(patterns: &[String]) -> miette::Result<Vec<glob::Pattern>> {
@@ -251,7 +284,7 @@ mod app {
         let mut out = Vec::new();
         for source in sources {
             if source.is_dir() {
-                let base_name = stem_or_name(source);
+                let base_name = dir_base_name(source);
                 let mut components = vec![base_name];
                 collect_markdown_files(source, source, &mut components, include, exclude, &mut out)?;
             } else if source.is_file() {
@@ -272,6 +305,18 @@ mod app {
             .and_then(|s| s.to_str())
             .unwrap_or("untitled")
             .to_string()
+    }
+
+    /// Like [`stem_or_name`], but for a directory argument's *own* mount
+    /// name: canonicalizes first so a path ending in `.`/`..` (e.g. the
+    /// current directory) resolves to the real directory name instead of
+    /// falling back to "untitled" (`Path::file_name` returns `None` when
+    /// the last component is `.` or `..`).
+    fn dir_base_name(path: &Path) -> String {
+        match path.canonicalize() {
+            Ok(resolved) => stem_or_name(&resolved),
+            Err(_) => stem_or_name(path),
+        }
     }
 
     fn collect_markdown_files(
@@ -320,6 +365,13 @@ mod app {
         use super::*;
 
         #[test]
+        fn filter_forces_read_only_even_with_write() {
+            assert!(effective_readonly(true, true));
+            assert!(!effective_readonly(true, false));
+            assert!(effective_readonly(false, false));
+        }
+
+        #[test]
         fn glob_allows_matches_only_included_patterns() {
             let include = compile_globs(&["guide/*.md".to_string()]).unwrap();
             assert!(glob_allows(Path::new("guide/a.md"), &include, &[]));
@@ -339,6 +391,26 @@ mod app {
             let exclude = compile_globs(&["*.tmp.md".to_string()]).unwrap();
             assert!(glob_allows(Path::new("a.md"), &[], &exclude));
             assert!(!glob_allows(Path::new("a.tmp.md"), &[], &exclude));
+        }
+
+        #[test]
+        fn dir_base_name_resolves_bare_current_dir_argument() {
+            let dir = tempfile::tempdir().unwrap();
+            let expected = stem_or_name(&dir.path().canonicalize().unwrap());
+
+            let original_cwd = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir.path()).unwrap();
+            let result = std::panic::catch_unwind(|| {
+                let here = Path::new(".");
+                // `Path::file_name` is `None` when the whole path is just
+                // `.` (what a bare `.` argument becomes), so `stem_or_name`
+                // alone falls back to "untitled"; `dir_base_name` must
+                // resolve it to the real directory name instead.
+                assert_eq!(stem_or_name(here), "untitled");
+                assert_eq!(dir_base_name(here), expected);
+            });
+            std::env::set_current_dir(original_cwd).unwrap();
+            result.unwrap();
         }
 
         #[test]

@@ -11,6 +11,13 @@ use rustc_hash::FxHashMap;
 /// The canonical file name for a section's own body content.
 pub const CONTENT_FILE: &str = "content.md";
 
+/// A predicate tested against a single heading node to decide whether the
+/// section it opens should be exposed in the mount (`--filter`). Kept as a
+/// generic closure type, rather than referencing the query engine that
+/// builds one, so this FUSE-independent core never depends on it — only the
+/// `mount`-feature-gated CLI layer knows about `mq-lang`.
+pub type HeadingFilter = dyn Fn(&Node) -> bool + Send + Sync;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FrontMatterKind {
     Yaml,
@@ -226,6 +233,36 @@ impl Document {
 
     pub fn tree(&self) -> SectionTree {
         SectionTree::build(&self.markdown.nodes)
+    }
+
+    /// Like [`Self::tree`], but prunes out any section that neither matches
+    /// `filter` itself nor has a descendant that does (`--filter`). A
+    /// section's ancestors stay visible even when they don't match
+    /// themselves, so a match remains reachable by path; the synthetic root
+    /// always survives.
+    pub fn tree_filtered(&self, filter: &HeadingFilter) -> SectionTree {
+        let tree = self.tree();
+        SectionTree {
+            front_matter: tree.front_matter,
+            root: self.pruned(tree.root, filter),
+        }
+    }
+
+    fn pruned(&self, section: Section, filter: &HeadingFilter) -> Section {
+        let children = section
+            .children
+            .into_iter()
+            .filter_map(|child| self.pruned_child(child, filter))
+            .collect();
+        Section { children, ..section }
+    }
+
+    fn pruned_child(&self, section: Section, filter: &HeadingFilter) -> Option<Section> {
+        let self_matches = section
+            .heading_index
+            .is_some_and(|idx| filter(&self.markdown.nodes[idx]));
+        let section = self.pruned(section, filter);
+        (self_matches || !section.children.is_empty()).then_some(section)
     }
 
     /// Full-document render, used both to serve reads of a fresh mount and to
@@ -576,6 +613,41 @@ mod tests {
         let (found_kind, idx) = tree.front_matter.expect("front matter present");
         assert_eq!(found_kind, kind);
         assert_eq!(doc.frontmatter_value(idx).trim(), "key: value");
+    }
+
+    fn depth_filter(depth: u8) -> impl Fn(&Node) -> bool {
+        move |node: &Node| matches!(node, Node::Heading(h) if h.depth == depth)
+    }
+
+    #[test]
+    fn tree_filtered_keeps_only_matching_sections() {
+        let doc = Document::parse("# A\n\n## B\n\nb\n\n# C\n\nc\n").unwrap();
+        let tree = doc.tree_filtered(&depth_filter(1));
+        assert_eq!(names(&tree.root.children), vec!["A", "C"]);
+        assert!(tree.find(&["A", "B"]).is_none(), "a non-matching child is pruned");
+    }
+
+    #[test]
+    fn tree_filtered_keeps_non_matching_ancestors_of_a_match() {
+        let doc = Document::parse("# A\n\n## B\n\n### C\n\nleaf\n").unwrap();
+        // Only depth-3 headings match; A and B don't match themselves but
+        // must stay visible so C remains reachable by path.
+        let tree = doc.tree_filtered(&depth_filter(3));
+        let c = tree
+            .find(&["A", "B", "C"])
+            .expect("matching leaf survives under its ancestors");
+        assert_eq!(doc.render_range(c.own_content_range.clone()).trim(), "leaf");
+        assert!(
+            tree.find(&["A"]).unwrap().children.len() == 1,
+            "A keeps only the path to the match"
+        );
+    }
+
+    #[test]
+    fn tree_filtered_with_no_match_collapses_to_an_empty_root() {
+        let doc = Document::parse("# A\n\n## B\n\nb\n").unwrap();
+        let tree = doc.tree_filtered(&depth_filter(9));
+        assert!(tree.root.children.is_empty());
     }
 
     #[test]
