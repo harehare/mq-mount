@@ -15,7 +15,7 @@
 use std::fs;
 use std::ops::Range;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use rustc_hash::FxHashMap;
@@ -33,6 +33,11 @@ struct FileMount {
     tree: document::SectionTree,
     inodes: InodeTable,
     source_path: PathBuf,
+    /// Full mount-path components (including this file's own leaf name),
+    /// e.g. `["docs", "guide", "a"]` for a file mounted under a directory
+    /// argument. Used to build root-relative links in the mount-root
+    /// aggregate `_toc.md` (see [`MountState::root_toc_bytes`]).
+    mount_path: Vec<String>,
     last_persisted: String,
     last_known_mtime: Option<SystemTime>,
     /// Set by a deferred (write()-driven) commit; cleared once a flush
@@ -43,27 +48,54 @@ struct FileMount {
     /// are load-bearing elsewhere) but is unreachable and excluded from
     /// background flush/reload.
     removed: bool,
+    /// Whether [`Self::backup_path`] has already been written (or already
+    /// existed) since this file was opened. Checked, not just set, so a
+    /// `--backup` mount never overwrites an existing backup — that would
+    /// clobber the true original with a later, possibly-edited state on a
+    /// remount. See [`MountState::persist`].
+    backed_up: bool,
 }
 
 impl FileMount {
-    fn open(source_path: PathBuf, next_ino: &mut Ino, toc_enabled: bool) -> std::io::Result<Self> {
+    fn open(
+        source_path: PathBuf,
+        next_ino: &mut Ino,
+        toc_enabled: bool,
+        mount_path: Vec<String>,
+        filter: Option<&document::HeadingFilter>,
+    ) -> std::io::Result<Self> {
         let text = fs::read_to_string(&source_path)?;
         let mtime = fs::metadata(&source_path).ok().and_then(|m| m.modified().ok());
         let document = Document::parse(&text).map_err(|e| std::io::Error::other(e.to_string()))?;
-        let tree = document.tree();
+        let tree = match filter {
+            Some(f) => document.tree_filtered(f),
+            None => document.tree(),
+        };
         let mut inodes = InodeTable::new();
         inodes.sync(next_ino, &tree, toc_enabled);
+        let backed_up = backup_path(&source_path).exists();
         Ok(Self {
             document,
             tree,
             inodes,
             source_path,
+            mount_path,
             last_persisted: text,
             last_known_mtime: mtime,
             dirty: false,
             removed: false,
+            backed_up,
         })
     }
+}
+
+/// The sibling path a `--backup` snapshot is written to: the whole filename
+/// with a literal `.orig` suffix appended (not an extension swap), so it
+/// stays collision-safe for filenames with multiple dots.
+fn backup_path(source_path: &std::path::Path) -> PathBuf {
+    let mut name = source_path.as_os_str().to_owned();
+    name.push(".orig");
+    PathBuf::from(name)
 }
 
 struct SuperDir {
@@ -98,6 +130,20 @@ struct MountState {
     /// Whether every mounted file exposes a synthetic, read-only `_toc.md`
     /// at its root (`--toc`).
     toc: bool,
+    /// The synthetic, read-only `_toc.md` at the mount root aggregating
+    /// every mounted file's heading tree in one place, present only when
+    /// `toc` is set. Deliberately not owned by any single file's
+    /// `InodeTable` since it spans all of them; instead it's a plain entry
+    /// in `ROOT_INO`'s `SuperDir::children`, so `lookup`/`readdir` see it
+    /// for free through their existing generic `super_dirs` handling.
+    root_toc_ino: Option<Ino>,
+    /// Whether the very first write to each mounted file's source should be
+    /// preceded by a one-time snapshot of its pre-edit bytes (`--backup`).
+    backup: bool,
+    /// `--filter`: a compiled query tested against each heading; a section
+    /// is exposed only if it (or a descendant) matches. `None` mounts every
+    /// section, as before. Forces the mount read-only at the CLI layer.
+    filter: Option<Arc<document::HeadingFilter>>,
 }
 
 impl MountState {
@@ -106,15 +152,15 @@ impl MountState {
         readonly: bool,
         allow_other: bool,
         toc: bool,
+        backup: bool,
+        filter: Option<Arc<document::HeadingFilter>>,
     ) -> std::io::Result<Self> {
         let mut next_ino = ROOT_INO + 1;
         let mut files = Vec::with_capacity(entries.len());
-        let mut mount_paths = Vec::with_capacity(entries.len());
         let mut mounted_paths = FxHashMap::default();
         for (idx, (source_path, mount_path)) in entries.into_iter().enumerate() {
-            let file = FileMount::open(source_path.clone(), &mut next_ino, toc)?;
+            let file = FileMount::open(source_path.clone(), &mut next_ino, toc, mount_path, filter.as_deref())?;
             mounted_paths.insert(source_path, idx);
-            mount_paths.push(mount_path);
             files.push(file);
         }
 
@@ -140,6 +186,9 @@ impl MountState {
             uid: 0,
             gid: 0,
             toc,
+            root_toc_ino: None,
+            backup,
+            filter,
         };
         #[cfg(unix)]
         {
@@ -148,8 +197,18 @@ impl MountState {
             state.gid = gid;
         }
 
-        let leaves: Vec<(usize, Vec<String>)> = mount_paths.into_iter().enumerate().collect();
-        let (root_children, root_seen) = state.build_super_level(ROOT_INO, leaves);
+        let leaves: Vec<(usize, Vec<String>)> = state
+            .files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (i, f.mount_path.clone()))
+            .collect();
+        let (mut root_children, root_seen) = state.build_super_level(ROOT_INO, leaves);
+        if toc {
+            let toc_ino = state.alloc_ino();
+            state.root_toc_ino = Some(toc_ino);
+            root_children.push((TOC_FILE.to_string(), toc_ino));
+        }
         state.super_dirs.insert(
             ROOT_INO,
             SuperDir {
@@ -171,7 +230,13 @@ impl MountState {
             return Ok(());
         }
 
-        let file = FileMount::open(source_path.clone(), &mut self.next_ino, self.toc)?;
+        let file = FileMount::open(
+            source_path.clone(),
+            &mut self.next_ino,
+            self.toc,
+            mount_path.clone(),
+            self.filter.as_deref(),
+        )?;
         let file_idx = self.files.len();
         let entry_inos: Vec<Ino> = file.inodes.entries().map(|(ino, _)| ino).collect();
         let root_ino = file.inodes.root_dir_ino();
@@ -192,6 +257,9 @@ impl MountState {
         let name = document::unique_name(&mut super_dir.seen_names, mount_path.last().unwrap());
         super_dir.children.push((name, root_ino));
         self.file_root_parent.insert(file_idx, parent_ino);
+        if let Some(toc_ino) = self.root_toc_ino {
+            self.content_cache.remove(&toc_ino);
+        }
         Ok(())
     }
 
@@ -216,6 +284,9 @@ impl MountState {
             && let Some(super_dir) = self.super_dirs.get_mut(&parent_ino)
         {
             super_dir.children.retain(|(_, ino)| *ino != root_ino);
+        }
+        if let Some(toc_ino) = self.root_toc_ino {
+            self.content_cache.remove(&toc_ino);
         }
         true
     }
@@ -318,11 +389,16 @@ impl MountState {
             ino_owner,
             content_cache,
             toc,
+            root_toc_ino,
+            filter,
             ..
         } = self;
         let file = &mut files[file_idx];
         let old_inos: Vec<Ino> = file.inodes.entries().map(|(ino, _)| ino).collect();
-        file.tree = file.document.tree();
+        file.tree = match filter.as_deref() {
+            Some(f) => file.document.tree_filtered(f),
+            None => file.document.tree(),
+        };
         file.inodes.sync(next_ino, &file.tree, *toc);
         for ino in old_inos {
             ino_owner.remove(&ino);
@@ -332,6 +408,11 @@ impl MountState {
         }
         for (ino, _) in file.inodes.entries() {
             ino_owner.insert(ino, file_idx);
+        }
+        // The mount-root aggregate `_toc.md` spans every file, so any single
+        // file's mutation invalidates its cache too.
+        if let Some(toc_ino) = root_toc_ino {
+            content_cache.remove(toc_ino);
         }
     }
 
@@ -352,6 +433,15 @@ impl MountState {
                 file.source_path.display()
             );
             return Err(VfsError::Conflict);
+        }
+        if self.backup && !file.backed_up {
+            let orig = backup_path(&file.source_path);
+            if !orig.exists()
+                && let Err(e) = fs::write(&orig, &file.last_persisted)
+            {
+                tracing::warn!("failed to write --backup snapshot to {}: {e}", orig.display());
+            }
+            file.backed_up = true;
         }
         fs::write(&file.source_path, &rendered).map_err(|_| VfsError::Io)?;
         file.last_persisted = rendered;
@@ -533,22 +623,37 @@ impl MountState {
 
     fn toc_bytes(&self, file_idx: usize) -> Vec<u8> {
         let mut out = String::from("# Table of Contents\n\n");
-        fn walk(sections: &[Section], prefix: &[String], indent: usize, out: &mut String) {
-            for s in sections {
-                let mut path = prefix.to_vec();
-                path.push(s.name.clone());
-                out.push_str(&"  ".repeat(indent));
-                out.push_str(&format!(
-                    "- [{}]({}/{})\n",
-                    s.name,
-                    path.join("/"),
-                    document::CONTENT_FILE
-                ));
-                walk(&s.children, &path, indent + 1, out);
-            }
-        }
-        walk(&self.files[file_idx].tree.root.children, &[], 0, &mut out);
+        write_toc_entries(&self.files[file_idx].tree.root.children, &[], 0, &mut out);
         out.into_bytes()
+    }
+
+    /// The mount-root aggregate `_toc.md` (present whenever `--toc` is set):
+    /// every mounted file's heading tree, in one read, with links rooted at
+    /// the mount's own top level instead of each file's own directory.
+    fn root_toc_bytes(&self) -> Vec<u8> {
+        let mut out = String::from("# Table of Contents\n\n");
+        for file in &self.files {
+            if file.removed {
+                continue;
+            }
+            out.push_str(&format!("## {}\n\n", file.mount_path.join("/")));
+            write_toc_entries(&file.tree.root.children, &file.mount_path, 0, &mut out);
+            out.push('\n');
+        }
+        out.into_bytes()
+    }
+
+    /// Like [`Self::content_bytes_cached`], but for [`Self::root_toc_ino`]
+    /// specifically, which (unlike every other cached ino) isn't owned by
+    /// any single file's `InodeTable`.
+    fn root_toc_bytes_cached(&mut self) -> Vec<u8> {
+        let ino = self.root_toc_ino.expect("only called when root_toc_ino is set");
+        if let Some(cached) = self.content_cache.get(&ino) {
+            return cached.clone();
+        }
+        let bytes = self.root_toc_bytes();
+        self.content_cache.insert(ino, bytes.clone());
+        bytes
     }
 
     /// Renders and caches bytes for a content/frontmatter/toc inode, reusing
@@ -600,6 +705,26 @@ impl MountState {
                 self.attr(ino, FileKind::File, len)
             }
         }
+    }
+}
+
+/// Recursively appends a Markdown bullet list of `sections` to `out`, each
+/// entry linking to that section's `content.md`. `link_prefix` roots the
+/// links (empty for a per-file `_toc.md`, a file's own `mount_path` for the
+/// mount-root aggregate one), shared by [`MountState::toc_bytes`] and
+/// [`MountState::root_toc_bytes`].
+fn write_toc_entries(sections: &[Section], link_prefix: &[String], indent: usize, out: &mut String) {
+    for s in sections {
+        let mut path = link_prefix.to_vec();
+        path.push(s.name.clone());
+        out.push_str(&"  ".repeat(indent));
+        out.push_str(&format!(
+            "- [{}]({}/{})\n",
+            s.name,
+            path.join("/"),
+            document::CONTENT_FILE
+        ));
+        write_toc_entries(&s.children, &path, indent + 1, out);
     }
 }
 
@@ -661,9 +786,11 @@ impl MqFs {
         readonly: bool,
         allow_other: bool,
         toc: bool,
+        backup: bool,
+        filter: Option<Arc<document::HeadingFilter>>,
     ) -> std::io::Result<Self> {
         Ok(Self {
-            state: Mutex::new(MountState::open(entries, readonly, allow_other, toc)?),
+            state: Mutex::new(MountState::open(entries, readonly, allow_other, toc, backup, filter)?),
         })
     }
 
@@ -792,6 +919,10 @@ impl MountFs for MqFs {
             tracing::debug!("getattr({ino}): scratch, {} bytes", buf.len());
             return Ok(state.attr(ino, FileKind::File, buf.len() as u64));
         }
+        if Some(ino) == state.root_toc_ino {
+            let size = state.root_toc_bytes_cached().len() as u64;
+            return Ok(state.attr(ino, FileKind::File, size));
+        }
         if state.super_dirs.contains_key(&ino) {
             return Ok(state.attr(ino, FileKind::Dir, 0));
         }
@@ -807,6 +938,9 @@ impl MountFs for MqFs {
     fn truncate(&self, ino: Ino) -> Result<FileAttr, VfsError> {
         let mut state = self.state.lock().unwrap();
         if state.readonly {
+            return Err(VfsError::ReadOnly);
+        }
+        if Some(ino) == state.root_toc_ino {
             return Err(VfsError::ReadOnly);
         }
         tracing::debug!("truncate({ino})");
@@ -830,6 +964,8 @@ impl MountFs for MqFs {
         let mut state = self.state.lock().unwrap();
         let bytes: std::borrow::Cow<[u8]> = if let Some(buf) = state.scratch.get(&ino) {
             std::borrow::Cow::Borrowed(buf)
+        } else if Some(ino) == state.root_toc_ino {
+            std::borrow::Cow::Owned(state.root_toc_bytes_cached())
         } else {
             match state.path_for_ino(ino) {
                 Some((file_idx, path)) => std::borrow::Cow::Owned(state.bytes_for(file_idx, ino, &path)?),
@@ -854,6 +990,9 @@ impl MountFs for MqFs {
     fn write(&self, ino: Ino, offset: u64, data: &[u8]) -> Result<FileAttr, VfsError> {
         let mut state = self.state.lock().unwrap();
         if state.readonly {
+            return Err(VfsError::ReadOnly);
+        }
+        if Some(ino) == state.root_toc_ino {
             return Err(VfsError::ReadOnly);
         }
         let offset = offset as usize;
@@ -1076,11 +1215,21 @@ impl MountFs for MqFs {
         let now = SystemTime::now();
 
         if let Some(super_dir) = state.super_dirs.get(&ino) {
-            for (child_name, child_ino) in &super_dir.children {
+            // Cloned to end the borrow of `state.super_dirs` before the
+            // mount-root toc branch below needs `&mut state` to populate
+            // its content cache.
+            let children = super_dir.children.clone();
+            for (child_name, child_ino) in children {
+                let attr = if Some(child_ino) == state.root_toc_ino {
+                    let size = state.root_toc_bytes_cached().len() as u64;
+                    state.attr_at(child_ino, FileKind::File, size, now)
+                } else {
+                    state.attr_at(child_ino, FileKind::Dir, 0, now)
+                };
                 entries.push(DirEntryOwned {
-                    ino: *child_ino,
-                    name: child_name.clone(),
-                    attr: state.attr_at(*child_ino, FileKind::Dir, 0, now),
+                    ino: child_ino,
+                    name: child_name,
+                    attr,
                 });
             }
             return Ok(paginate(entries, start_after, max_entries));
@@ -1173,6 +1322,8 @@ mod tests {
             readonly,
             allow_other,
             toc,
+            false,
+            None,
         )
         .unwrap();
         let (entries, _) = fs.readdir(fs.root_ino(), 0, 100).unwrap();
@@ -1312,7 +1463,15 @@ mod tests {
         let b = dir.path().join("b.md");
         std::fs::write(&a, "# A\n\n## Sub\n\nbody\n").unwrap();
         std::fs::write(&b, "# B\n\nbody\n").unwrap();
-        let fs = MqFs::new(vec![(a, vec!["a".into()]), (b, vec!["b".into()])], false, false, false).unwrap();
+        let fs = MqFs::new(
+            vec![(a, vec!["a".into()]), (b, vec!["b".into()])],
+            false,
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
 
         let a_root = fs.lookup(ROOT_INO, "a").unwrap();
         let a_heading = fs.lookup(a_root, "A").unwrap();
@@ -1452,6 +1611,8 @@ mod tests {
             false,
             false,
             false,
+            false,
+            None,
         )
         .unwrap();
 
@@ -1492,6 +1653,8 @@ mod tests {
             false,
             false,
             false,
+            false,
+            None,
         )
         .unwrap();
 
@@ -1551,7 +1714,15 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("docs")).unwrap();
         let a = dir.path().join("docs/a.md");
         std::fs::write(&a, "# A\n").unwrap();
-        let fs = MqFs::new(vec![(a, vec!["docs".into(), "a".into()])], false, false, false).unwrap();
+        let fs = MqFs::new(
+            vec![(a, vec!["docs".into(), "a".into()])],
+            false,
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
         let docs_ino_before = fs.lookup(ROOT_INO, "docs").unwrap();
 
         let b = dir.path().join("docs/b.md");
@@ -1620,6 +1791,147 @@ mod tests {
         let toc_ino = fs.lookup(file_ino, TOC_FILE).unwrap();
         assert!(matches!(fs.write(toc_ino, 0, b"x"), Err(VfsError::ReadOnly)));
         assert!(matches!(fs.remove(file_ino, TOC_FILE), Err(VfsError::ReadOnly)));
+    }
+
+    #[test]
+    fn root_toc_file_aggregates_every_mounted_files_heading_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        std::fs::write(&a, "# A Title\n\nintro\n").unwrap();
+        std::fs::write(&b, "# B Title\n\nintro\n").unwrap();
+        let fs = MqFs::new(
+            vec![(a, vec!["a".into()]), (b, vec!["b".into()])],
+            false,
+            false,
+            true,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let toc_ino = fs.lookup(ROOT_INO, TOC_FILE).unwrap();
+        let (bytes, _) = fs.read(toc_ino, 0, 4096).unwrap();
+        let toc = String::from_utf8(bytes).unwrap();
+        assert!(toc.contains("## a"));
+        assert!(toc.contains("[A Title](a/A Title/content.md)"));
+        assert!(toc.contains("## b"));
+        assert!(toc.contains("[B Title](b/B Title/content.md)"));
+
+        let (entries, _) = fs.readdir(ROOT_INO, 0, 100).unwrap();
+        let toc_entry = entries.iter().find(|e| e.name == TOC_FILE).unwrap();
+        assert_eq!(toc_entry.attr.kind, FileKind::File);
+    }
+
+    #[test]
+    fn root_toc_file_is_absent_without_the_toc_flag() {
+        let (fs, _dir, _file_ino) = mounted("# Title\n\nbody\n");
+        assert!(matches!(fs.lookup(ROOT_INO, TOC_FILE), Err(VfsError::NotFound)));
+    }
+
+    #[test]
+    fn root_toc_file_rejects_writes() {
+        let (fs, _dir, _file_ino) = mounted_with_toc("# Title\n\nbody\n", false, false, true);
+        let toc_ino = fs.lookup(ROOT_INO, TOC_FILE).unwrap();
+        assert!(matches!(fs.write(toc_ino, 0, b"x"), Err(VfsError::ReadOnly)));
+        assert!(matches!(fs.truncate(toc_ino), Err(VfsError::ReadOnly)));
+    }
+
+    #[test]
+    fn root_toc_file_reflects_an_edit_after_rebuild() {
+        let (fs, _dir, file_ino) = mounted_with_toc("# Title\n\nbody\n", false, false, true);
+        let toc_ino = fs.lookup(ROOT_INO, TOC_FILE).unwrap();
+        let (before, _) = fs.read(toc_ino, 0, 4096).unwrap();
+        assert!(!String::from_utf8(before).unwrap().contains("New"));
+
+        fs.mkdir(file_ino, "New").unwrap();
+
+        let (after, _) = fs.read(toc_ino, 0, 4096).unwrap();
+        assert!(String::from_utf8(after).unwrap().contains("New"));
+    }
+
+    #[test]
+    fn backup_snapshots_the_original_before_the_first_write_and_never_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "# Title\n\noriginal\n").unwrap();
+        let orig_path = dir.path().join("doc.md.orig");
+
+        let fs = MqFs::new(
+            vec![(path.clone(), vec!["doc".to_string()])],
+            false,
+            false,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        let (entries, _) = fs.readdir(fs.root_ino(), 0, 100).unwrap();
+        let file_ino = entries[0].ino;
+        let content_ino = lookup_path(&fs, file_ino, &["Title", "content.md"]);
+
+        assert!(!orig_path.exists(), "no backup until the first write");
+        fs.write(content_ino, 0, b"edited\n").unwrap();
+        fs.flush();
+        assert_eq!(std::fs::read_to_string(&orig_path).unwrap(), "# Title\n\noriginal\n");
+
+        // A second edit must not clobber the original snapshot.
+        fs.write(content_ino, 0, b"edited again\n").unwrap();
+        fs.flush();
+        assert_eq!(std::fs::read_to_string(&orig_path).unwrap(), "# Title\n\noriginal\n");
+    }
+
+    #[test]
+    fn backup_does_not_overwrite_a_snapshot_left_by_an_earlier_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "# Title\n\nalready edited once\n").unwrap();
+        let orig_path = dir.path().join("doc.md.orig");
+        std::fs::write(&orig_path, "# Title\n\ntrue original\n").unwrap();
+
+        let fs = MqFs::new(
+            vec![(path.clone(), vec!["doc".to_string()])],
+            false,
+            false,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        let (entries, _) = fs.readdir(fs.root_ino(), 0, 100).unwrap();
+        let file_ino = entries[0].ino;
+        let content_ino = lookup_path(&fs, file_ino, &["Title", "content.md"]);
+        fs.write(content_ino, 0, b"edited again\n").unwrap();
+        fs.flush();
+
+        assert_eq!(
+            std::fs::read_to_string(&orig_path).unwrap(),
+            "# Title\n\ntrue original\n"
+        );
+    }
+
+    #[test]
+    fn filter_exposes_only_matching_sections_and_their_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "# A\n\n## Keep\n\nk\n\n## Drop\n\nd\n").unwrap();
+        let filter: Arc<document::HeadingFilter> = Arc::new(|node: &mq_markdown::Node| node.value().contains("Keep"));
+
+        let fs = MqFs::new(
+            vec![(path.clone(), vec!["doc".to_string()])],
+            false,
+            false,
+            false,
+            false,
+            Some(filter),
+        )
+        .unwrap();
+        let (entries, _) = fs.readdir(fs.root_ino(), 0, 100).unwrap();
+        let file_ino = entries[0].ino;
+        let a_ino = fs.lookup(file_ino, "A").unwrap();
+
+        assert!(fs.lookup(a_ino, "Keep").is_ok());
+        assert!(matches!(fs.lookup(a_ino, "Drop"), Err(VfsError::NotFound)));
     }
 
     #[test]

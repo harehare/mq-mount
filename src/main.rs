@@ -10,6 +10,9 @@ mod backend;
 mod daemon;
 
 #[cfg(feature = "mount")]
+mod query_filter;
+
+#[cfg(feature = "mount")]
 mod watch;
 
 #[cfg(feature = "mount")]
@@ -55,12 +58,25 @@ mod app {
         /// --include
         #[arg(long = "exclude", value_name = "GLOB")]
         exclude: Vec<String>,
+        /// Only expose sections whose heading matches this mq query (e.g.
+        /// `.h1`, `select(contains("TODO"))`); ancestors of a match stay
+        /// visible so it remains reachable by path. Always mounts
+        /// read-only, regardless of --write
+        #[arg(long, value_name = "QUERY")]
+        filter: Option<String>,
+        /// Before the first write to each source file, save its pre-edit
+        /// bytes to a sibling `<file>.orig` (skipped if one already exists)
+        #[arg(long)]
+        backup: bool,
         /// Run detached from the terminal; the child keeps running once this process exits
         #[arg(short = 'd', long)]
         background: bool,
         /// Stop a running mount (background or foreground) at this mountpoint and exit
-        #[arg(long, value_name = "MOUNTPOINT", conflicts_with_all = ["paths", "write", "allow_other", "watch", "toc", "include", "exclude", "background"])]
+        #[arg(long, value_name = "MOUNTPOINT", conflicts_with_all = ["paths", "write", "allow_other", "watch", "toc", "include", "exclude", "filter", "backup", "background", "list"])]
         stop: Option<PathBuf>,
+        /// List currently running background mounts and exit
+        #[arg(long, conflicts_with_all = ["paths", "write", "allow_other", "watch", "toc", "include", "exclude", "filter", "backup", "background", "stop"])]
+        list: bool,
         /// Enable verbose (debug) logging
         #[arg(short, long)]
         verbose: bool,
@@ -76,6 +92,10 @@ mod app {
 
         if let Some(mountpoint) = &cli.stop {
             return crate::daemon::stop(mountpoint);
+        }
+
+        if cli.list {
+            return crate::daemon::list();
         }
 
         if cli.paths.len() < 2 {
@@ -99,7 +119,11 @@ mod app {
             .canonicalize()
             .map_err(|e| miette::miette!("failed to resolve {}: {e}", mountpoint.display()))?;
 
-        let readonly = !cli.write;
+        let readonly = effective_readonly(cli.write, cli.filter.is_some());
+        if cli.write && cli.filter.is_some() {
+            tracing::warn!("--filter always mounts read-only; ignoring --write");
+        }
+        let heading_filter = cli.filter.as_deref().map(crate::query_filter::compile).transpose()?;
 
         let include = compile_globs(&cli.include)?;
         let exclude = compile_globs(&cli.exclude)?;
@@ -123,7 +147,7 @@ mod app {
         }
 
         let filesystem = Arc::new(
-            MqFs::new(entries, readonly, cli.allow_other, cli.toc)
+            MqFs::new(entries, readonly, cli.allow_other, cli.toc, cli.backup, heading_filter)
                 .map_err(|e| miette::miette!("failed to read source file(s): {e}"))?,
         );
         if !watch_roots.is_empty() {
@@ -223,6 +247,15 @@ mod app {
         }
     }
 
+    /// A `--filter`ed mount is always read-only: writing into a document
+    /// whose non-matching sections are hidden from the mount is out of
+    /// scope (there'd be no way to splice an edit back in among content the
+    /// mount never showed), so `--filter` overrides `--write` rather than
+    /// conflicting with it.
+    fn effective_readonly(write: bool, filtered: bool) -> bool {
+        !write || filtered
+    }
+
     /// Compiles `--include`/`--exclude` globs, matched against a `.md`
     /// file's path relative to the directory argument it was found under.
     pub(crate) fn compile_globs(patterns: &[String]) -> miette::Result<Vec<glob::Pattern>> {
@@ -318,6 +351,13 @@ mod app {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn filter_forces_read_only_even_with_write() {
+            assert!(effective_readonly(true, true));
+            assert!(!effective_readonly(true, false));
+            assert!(effective_readonly(false, false));
+        }
 
         #[test]
         fn glob_allows_matches_only_included_patterns() {

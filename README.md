@@ -38,16 +38,16 @@ front matter
 ---                       ->  /a/_frontmatter.yaml (or _frontmatter.toml)
 ```
 
-- With `--toc`, every mounted file also gets a read-only `/a/_toc.md`: a linked Markdown list of its whole heading tree (e.g. `- [Sub A](Title/Sub A/content.md)`). Lets an agent see the structure in one read instead of walking every directory with `ls`.
+- With `--toc`, every mounted file also gets a read-only `/a/_toc.md`: a linked Markdown list of its whole heading tree (e.g. `- [Sub A](Title/Sub A/content.md)`). Lets an agent see the structure in one read instead of walking every directory with `ls`. The mount root also gets a read-only `/_toc.md` aggregating every mounted file's heading tree in one place, under a `## <file>` heading each.
 - A section's `content.md` holds only its own body — text up to the *next* heading of any depth, not its subsections'.
 - Nesting follows heading depth and document order, not indentation. Typing `#` inside a deeply-nested section's `content.md` creates a new top-level directory *within that file* on save, not a nested one.
 - The top-level, per-file/per-directory layout is fixed at mount time: `mkdir`/`rmdir`/`rename` there, or moving `content.md` between two mounted files, aren't supported (`EPERM`/`ENOENT`/`EOPNOTSUPP`).
 
 ## Read/write semantics
 
-- Mounts are read-only by default; pass `--write` to allow edits to reach the source file(s).
+- Mounts are read-only by default; pass `--write` to allow edits to reach the source file(s). `--filter` always mounts read-only, even with `--write` (a warning is logged if both are given).
 - Saving `content.md` updates the in-memory document immediately (reads see it right away, e.g. a new heading becomes a subdirectory on the next `ls`). The write to disk is batched — flushed within ~150ms, or before unmount/Ctrl-C.
-- `_toc.md` is always computed fresh, never stale.
+- `_toc.md` (per file and at the mount root) is always computed fresh, never stale.
 - `mkdir NAME` adds an empty subheading. Fails with `EEXIST` if a sibling already has that name.
 - `rmdir` is POSIX-strict: only an already-empty directory (no subdirectories, empty `content.md`) can be removed. `rm -r` still deletes a whole section, since the shell unlinks bottom-up.
 - Renaming a directory renames the heading. Moving it to a different parent in the same mounted file reparents the heading and its subtree, adjusting heading depth to fit.
@@ -63,7 +63,7 @@ front matter
 
 ## Known limitations
 
-- **Not byte-exact.** Every flush re-renders the whole document, which can normalize whitespace, blank lines, list markers, and table padding. mq-mount skips the rewrite when the render is unchanged, but the first save after mount may still differ from the original bytes even with no logical edit.
+- **Not byte-exact.** Every flush re-renders the whole document, which can normalize whitespace, blank lines, list markers, and table padding. mq-mount skips the rewrite when the render is unchanged, but the first save after mount may still differ from the original bytes even with no logical edit. Pass `--backup` to snapshot each source file's pre-edit bytes to a sibling `<file>.orig` before its first write.
 - **External changes are auto-reloaded, not merged.** An external edit is picked up on the next tick (~150ms) if there's no pending local edit. If there is, the mount refuses to overwrite it (`ESTALE`/`STATUS_FILE_LOCK_CONFLICT`) instead of silently discarding either version — unmount and remount to reconcile by hand.
 - **A deferred write can be lost on a hard kill.** Writes are batched rather than flushed on every `write()`; a crash, `kill -9`, or forced termination can lose up to ~150ms of unflushed edits. A graceful stop (Ctrl-C, SIGTERM, `--stop`) always flushes first.
 - **External unmounts are noticed within a couple of seconds, not instantly.** macOS/Linux poll every 2s. On Windows, `--stop` forcibly terminates the process (no graceful cross-process signal); WinFSP still unmounts cleanly when its host process dies.
@@ -137,6 +137,16 @@ mq-mount docs/ /tmp/doc-mount -d
 mq-mount --stop /tmp/doc-mount
 # A background mount also exits on its own if the volume is unmounted some
 # other way (Finder/Explorer eject, diskutil/umount) — no orphaned process.
+
+# List every currently running background mount (like `docker ps`):
+mq-mount --list
+
+# Snapshot each source file's pre-edit bytes to <file>.orig before its first write:
+mq-mount README.md /tmp/doc-mount --write --backup
+
+# Only expose sections whose heading matches an mq query; always read-only:
+mq-mount README.md /tmp/doc-mount --filter '.h2'
+ls /tmp/doc-mount/README   # only depth-2 headings (and their ancestors) appear
 ```
 
 ### Options
@@ -171,10 +181,19 @@ Options:
       --exclude <GLOB>     Skip .md files under a directory argument whose
                             path (relative to that argument) matches this
                             glob; repeatable, applied after --include
+      --filter <QUERY>     Only expose sections whose heading matches this
+                            mq query (e.g. `.h1`, `select(contains("TODO"))`);
+                            ancestors of a match stay visible so it remains
+                            reachable by path. Always mounts read-only,
+                            regardless of --write
+      --backup             Before the first write to each source file, save
+                            its pre-edit bytes to a sibling `<file>.orig`
+                            (skipped if one already exists)
   -d, --background         Run detached from the terminal; the child keeps
                             running once this process exits
       --stop <MOUNTPOINT>  Stop a running mount (background or foreground)
                             at this mountpoint and exit
+      --list               List currently running background mounts and exit
   -v, --verbose            Enable verbose (debug) logging
   -h, --help               Print help
   -V, --version            Print version

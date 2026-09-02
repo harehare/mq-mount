@@ -105,6 +105,72 @@ fn read_pid(path: &Path, mountpoint: &Path) -> miette::Result<i32> {
         .ok_or_else(|| miette::miette!("corrupt pid file: {}", path.display()))
 }
 
+/// Like [`read_pid`], but for `--list`: a corrupt or unreadable pid file is
+/// skipped rather than aborting the whole listing.
+fn read_pid_and_mountpoint(path: &Path) -> Option<(i32, PathBuf)> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    let pid = lines.next()?.parse().ok()?;
+    let mountpoint = PathBuf::from(lines.next()?);
+    Some((pid, mountpoint))
+}
+
+#[cfg(unix)]
+fn is_alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn is_alive(pid: i32) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid as u32) {
+            Ok(handle) => {
+                let _ = CloseHandle(handle);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// Lists every currently-running background (or foreground) mount, found by
+/// scanning the state dir's `*.pid` files. Self-healing: a pid file whose
+/// process is no longer alive (e.g. it was `kill -9`'d, skipping
+/// `PidFileGuard`'s `Drop`) is removed instead of listed.
+pub fn list() -> miette::Result<()> {
+    let mut mounts = Vec::new();
+    if let Ok(entries) = fs::read_dir(state_dir()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("pid") {
+                continue;
+            }
+            let Some((pid, mountpoint)) = read_pid_and_mountpoint(&path) else {
+                continue;
+            };
+            if is_alive(pid) {
+                mounts.push((pid, mountpoint));
+            } else {
+                let _ = fs::remove_file(&path);
+                let _ = fs::remove_file(path.with_extension("log"));
+            }
+        }
+    }
+
+    if mounts.is_empty() {
+        println!("no running mounts");
+        return Ok(());
+    }
+    mounts.sort_by(|a, b| a.1.cmp(&b.1));
+    println!("{:<10} MOUNTPOINT", "PID");
+    for (pid, mountpoint) in mounts {
+        println!("{pid:<10} {}", mountpoint.display());
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 pub fn stop(mountpoint: &Path) -> miette::Result<()> {
     let mountpoint = canonical(mountpoint);
@@ -173,5 +239,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mountpoint = dir.path().join("never-mounted");
         assert!(stop(&mountpoint).is_err());
+    }
+
+    #[test]
+    fn read_pid_and_mountpoint_parses_the_pid_file_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.pid");
+        fs::write(&path, "12345\n/tmp/mnt\n").unwrap();
+        assert_eq!(read_pid_and_mountpoint(&path), Some((12345, PathBuf::from("/tmp/mnt"))));
+    }
+
+    #[test]
+    fn read_pid_and_mountpoint_is_none_for_a_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.pid");
+        fs::write(&path, "not-a-pid\n").unwrap();
+        assert_eq!(read_pid_and_mountpoint(&path), None);
+    }
+
+    #[test]
+    fn is_alive_is_true_for_the_current_process_and_false_for_a_bogus_pid() {
+        assert!(is_alive(std::process::id() as i32));
+        assert!(!is_alive(i32::MAX));
     }
 }
