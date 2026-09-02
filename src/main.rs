@@ -190,7 +190,7 @@ mod app {
             .filter(|s| s.is_dir())
             .map(|s| {
                 s.canonicalize()
-                    .map(|resolved| (resolved, vec![stem_or_name(s)]))
+                    .map(|resolved| (resolved, vec![dir_base_name(s)]))
                     .map_err(|e| miette::miette!("failed to resolve {}: {e}", s.display()))
             })
             .collect::<miette::Result<Vec<_>>>()?;
@@ -284,7 +284,7 @@ mod app {
         let mut out = Vec::new();
         for source in sources {
             if source.is_dir() {
-                let base_name = stem_or_name(source);
+                let base_name = dir_base_name(source);
                 let mut components = vec![base_name];
                 collect_markdown_files(source, source, &mut components, include, exclude, &mut out)?;
             } else if source.is_file() {
@@ -305,6 +305,18 @@ mod app {
             .and_then(|s| s.to_str())
             .unwrap_or("untitled")
             .to_string()
+    }
+
+    /// Like [`stem_or_name`], but for a directory argument's *own* mount
+    /// name: canonicalizes first so a path ending in `.`/`..` (e.g. the
+    /// current directory) resolves to the real directory name instead of
+    /// falling back to "untitled" (`Path::file_name` returns `None` when
+    /// the last component is `.` or `..`).
+    fn dir_base_name(path: &Path) -> String {
+        match path.canonicalize() {
+            Ok(resolved) => stem_or_name(&resolved),
+            Err(_) => stem_or_name(path),
+        }
     }
 
     fn collect_markdown_files(
@@ -379,6 +391,26 @@ mod app {
             let exclude = compile_globs(&["*.tmp.md".to_string()]).unwrap();
             assert!(glob_allows(Path::new("a.md"), &[], &exclude));
             assert!(!glob_allows(Path::new("a.tmp.md"), &[], &exclude));
+        }
+
+        #[test]
+        fn dir_base_name_resolves_bare_current_dir_argument() {
+            let dir = tempfile::tempdir().unwrap();
+            let expected = stem_or_name(&dir.path().canonicalize().unwrap());
+
+            let original_cwd = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir.path()).unwrap();
+            let result = std::panic::catch_unwind(|| {
+                let here = Path::new(".");
+                // `Path::file_name` is `None` when the whole path is just
+                // `.` (what a bare `.` argument becomes), so `stem_or_name`
+                // alone falls back to "untitled"; `dir_base_name` must
+                // resolve it to the real directory name instead.
+                assert_eq!(stem_or_name(here), "untitled");
+                assert_eq!(dir_base_name(here), expected);
+            });
+            std::env::set_current_dir(original_cwd).unwrap();
+            result.unwrap();
         }
 
         #[test]
