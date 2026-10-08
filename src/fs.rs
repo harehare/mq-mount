@@ -147,14 +147,14 @@ struct MountState {
 }
 
 impl MountState {
-    fn open(
-        entries: Vec<(PathBuf, Vec<String>)>,
-        readonly: bool,
-        allow_other: bool,
-        toc: bool,
-        backup: bool,
-        filter: Option<Arc<document::HeadingFilter>>,
-    ) -> std::io::Result<Self> {
+    fn open(entries: Vec<(PathBuf, Vec<String>)>, options: MountOptions) -> std::io::Result<Self> {
+        let MountOptions {
+            readonly,
+            allow_other,
+            toc,
+            backup,
+            filter,
+        } = options;
         let mut next_ino = ROOT_INO + 1;
         let mut files = Vec::with_capacity(entries.len());
         let mut mounted_paths = FxHashMap::default();
@@ -719,13 +719,40 @@ fn write_toc_entries(sections: &[Section], link_prefix: &[String], indent: usize
         path.push(s.name.clone());
         out.push_str(&"  ".repeat(indent));
         out.push_str(&format!(
-            "- [{}]({}/{})\n",
-            s.name,
-            path.join("/"),
+            "- [{}](<{}/{}>)\n",
+            escape_link_text(&s.name),
+            escape_link_destination(&path.join("/")),
             document::CONTENT_FILE
         ));
         write_toc_entries(&s.children, &path, indent + 1, out);
     }
+}
+
+/// Backslash-escapes characters that would otherwise end or restructure a
+/// link's `[text]` (or start emphasis/code inside it).
+fn escape_link_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '\\' | '[' | ']' | '*' | '_' | '`' | '<' | '>') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Escapes a path for use inside an angle-bracketed link destination
+/// (`[text](<dest>)`), the only CommonMark form that allows raw spaces and
+/// unbalanced parentheses — both common in heading-derived directory names.
+fn escape_link_destination(dest: &str) -> String {
+    let mut out = String::with_capacity(dest.len());
+    for c in dest.chars() {
+        if matches!(c, '\\' | '<' | '>') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn map_mutation_error(e: MutationError) -> VfsError {
@@ -776,21 +803,25 @@ fn paginate(entries: Vec<DirEntryOwned>, start_after: Ino, max_entries: usize) -
     (page, end)
 }
 
+/// Mount-wide settings chosen on the command line; see the matching CLI
+/// flags in `main.rs` for what each one does.
+#[derive(Clone, Default)]
+pub struct MountOptions {
+    pub readonly: bool,
+    pub allow_other: bool,
+    pub toc: bool,
+    pub backup: bool,
+    pub filter: Option<Arc<document::HeadingFilter>>,
+}
+
 pub struct MqFs {
     state: Mutex<MountState>,
 }
 
 impl MqFs {
-    pub fn new(
-        entries: Vec<(PathBuf, Vec<String>)>,
-        readonly: bool,
-        allow_other: bool,
-        toc: bool,
-        backup: bool,
-        filter: Option<Arc<document::HeadingFilter>>,
-    ) -> std::io::Result<Self> {
+    pub fn new(entries: Vec<(PathBuf, Vec<String>)>, options: MountOptions) -> std::io::Result<Self> {
         Ok(Self {
-            state: Mutex::new(MountState::open(entries, readonly, allow_other, toc, backup, filter)?),
+            state: Mutex::new(MountState::open(entries, options)?),
         })
     }
 
@@ -1319,11 +1350,12 @@ mod tests {
         std::fs::write(&path, content).unwrap();
         let fs = MqFs::new(
             vec![(path.clone(), vec!["doc".to_string()])],
-            readonly,
-            allow_other,
-            toc,
-            false,
-            None,
+            MountOptions {
+                readonly,
+                allow_other,
+                toc,
+                ..Default::default()
+            },
         )
         .unwrap();
         let (entries, _) = fs.readdir(fs.root_ino(), 0, 100).unwrap();
@@ -1465,11 +1497,7 @@ mod tests {
         std::fs::write(&b, "# B\n\nbody\n").unwrap();
         let fs = MqFs::new(
             vec![(a, vec!["a".into()]), (b, vec!["b".into()])],
-            false,
-            false,
-            false,
-            false,
-            None,
+            MountOptions::default(),
         )
         .unwrap();
 
@@ -1608,11 +1636,7 @@ mod tests {
                 (a, vec!["docs".into(), "guide".into(), "a".into()]),
                 (b, vec!["docs".into(), "api".into(), "b".into()]),
             ],
-            false,
-            false,
-            false,
-            false,
-            None,
+            MountOptions::default(),
         )
         .unwrap();
 
@@ -1650,11 +1674,7 @@ mod tests {
 
         let fs = MqFs::new(
             vec![(a, vec!["doc".into()]), (b, vec!["doc".into()])],
-            false,
-            false,
-            false,
-            false,
-            None,
+            MountOptions::default(),
         )
         .unwrap();
 
@@ -1714,15 +1734,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("docs")).unwrap();
         let a = dir.path().join("docs/a.md");
         std::fs::write(&a, "# A\n").unwrap();
-        let fs = MqFs::new(
-            vec![(a, vec!["docs".into(), "a".into()])],
-            false,
-            false,
-            false,
-            false,
-            None,
-        )
-        .unwrap();
+        let fs = MqFs::new(vec![(a, vec!["docs".into(), "a".into()])], MountOptions::default()).unwrap();
         let docs_ino_before = fs.lookup(ROOT_INO, "docs").unwrap();
 
         let b = dir.path().join("docs/b.md");
@@ -1775,8 +1787,32 @@ mod tests {
         let toc_ino = fs.lookup(file_ino, TOC_FILE).unwrap();
         let (bytes, _) = fs.read(toc_ino, 0, 4096).unwrap();
         let toc = String::from_utf8(bytes).unwrap();
-        assert!(toc.contains("[Title](Title/content.md)"));
-        assert!(toc.contains("[Sub A](Title/Sub A/content.md)"));
+        assert!(toc.contains("[Title](<Title/content.md>)"));
+        assert!(toc.contains("[Sub A](<Title/Sub A/content.md>)"));
+    }
+
+    #[test]
+    fn toc_links_parse_back_as_links_even_with_awkward_heading_names() {
+        let (fs, _dir, file_ino) = mounted_with_toc("# Setup (macOS)\n\n## a <b> [c]\n\nbody\n", false, false, true);
+        let toc_ino = fs.lookup(file_ino, TOC_FILE).unwrap();
+        let (bytes, _) = fs.read(toc_ino, 0, 4096).unwrap();
+        let toc = String::from_utf8(bytes).unwrap();
+        assert!(toc.contains("[Setup (macOS)](<Setup (macOS)/content.md>)"));
+        assert!(toc.contains(r"[a \<b\> \[c\]](<Setup (macOS)/a \<b\> [c]/content.md>)"));
+
+        let md: mq_markdown::Markdown = toc.parse().unwrap();
+        let urls: Vec<String> = md.nodes.iter().flat_map(collect_link_urls).collect();
+        assert_eq!(
+            urls,
+            vec!["Setup (macOS)/content.md", "Setup (macOS)/a <b> [c]/content.md"]
+        );
+    }
+
+    fn collect_link_urls(node: &mq_markdown::Node) -> Vec<String> {
+        match node {
+            mq_markdown::Node::Link(l) => vec![l.url.as_str().to_string()],
+            other => other.children().iter().flat_map(collect_link_urls).collect(),
+        }
     }
 
     #[test]
@@ -1802,11 +1838,10 @@ mod tests {
         std::fs::write(&b, "# B Title\n\nintro\n").unwrap();
         let fs = MqFs::new(
             vec![(a, vec!["a".into()]), (b, vec!["b".into()])],
-            false,
-            false,
-            true,
-            false,
-            None,
+            MountOptions {
+                toc: true,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -1814,9 +1849,9 @@ mod tests {
         let (bytes, _) = fs.read(toc_ino, 0, 4096).unwrap();
         let toc = String::from_utf8(bytes).unwrap();
         assert!(toc.contains("## a"));
-        assert!(toc.contains("[A Title](a/A Title/content.md)"));
+        assert!(toc.contains("[A Title](<a/A Title/content.md>)"));
         assert!(toc.contains("## b"));
-        assert!(toc.contains("[B Title](b/B Title/content.md)"));
+        assert!(toc.contains("[B Title](<b/B Title/content.md>)"));
 
         let (entries, _) = fs.readdir(ROOT_INO, 0, 100).unwrap();
         let toc_entry = entries.iter().find(|e| e.name == TOC_FILE).unwrap();
@@ -1859,11 +1894,10 @@ mod tests {
 
         let fs = MqFs::new(
             vec![(path.clone(), vec!["doc".to_string()])],
-            false,
-            false,
-            false,
-            true,
-            None,
+            MountOptions {
+                backup: true,
+                ..Default::default()
+            },
         )
         .unwrap();
         let (entries, _) = fs.readdir(fs.root_ino(), 0, 100).unwrap();
@@ -1891,11 +1925,10 @@ mod tests {
 
         let fs = MqFs::new(
             vec![(path.clone(), vec!["doc".to_string()])],
-            false,
-            false,
-            false,
-            true,
-            None,
+            MountOptions {
+                backup: true,
+                ..Default::default()
+            },
         )
         .unwrap();
         let (entries, _) = fs.readdir(fs.root_ino(), 0, 100).unwrap();
@@ -1919,11 +1952,10 @@ mod tests {
 
         let fs = MqFs::new(
             vec![(path.clone(), vec!["doc".to_string()])],
-            false,
-            false,
-            false,
-            false,
-            Some(filter),
+            MountOptions {
+                filter: Some(filter),
+                ..Default::default()
+            },
         )
         .unwrap();
         let (entries, _) = fs.readdir(fs.root_ino(), 0, 100).unwrap();

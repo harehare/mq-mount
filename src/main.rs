@@ -23,7 +23,7 @@ mod app {
 
     use clap::Parser;
 
-    use crate::fs::MqFs;
+    use crate::fs::{MountOptions, MqFs};
 
     /// Mount one or more Markdown files (or directories of them) as a
     /// virtual filesystem: each file gets a top-level directory named after
@@ -106,11 +106,11 @@ mod app {
         let (sources, mountpoint) = cli.paths.split_at(split_at);
         let mountpoint = &mountpoint[0];
 
-        if !mountpoint.is_dir() {
-            miette::bail!(
-                "mountpoint does not exist or is not a directory: {} (create it first)",
-                mountpoint.display()
-            );
+        if !mountpoint.exists() {
+            fs::create_dir_all(mountpoint)
+                .map_err(|e| miette::miette!("failed to create mountpoint {}: {e}", mountpoint.display()))?;
+        } else if !mountpoint.is_dir() {
+            miette::bail!("mountpoint is not a directory: {}", mountpoint.display());
         }
         // Canonicalized so it matches how `--stop` resolves the same path
         // (e.g. macOS's /var/folders -> /private/var/folders), and used
@@ -147,8 +147,17 @@ mod app {
         }
 
         let filesystem = Arc::new(
-            MqFs::new(entries, readonly, cli.allow_other, cli.toc, cli.backup, heading_filter)
-                .map_err(|e| miette::miette!("failed to read source file(s): {e}"))?,
+            MqFs::new(
+                entries,
+                MountOptions {
+                    readonly,
+                    allow_other: cli.allow_other,
+                    toc: cli.toc,
+                    backup: cli.backup,
+                    filter: heading_filter,
+                },
+            )
+            .map_err(|e| miette::miette!("failed to read source file(s): {e}"))?,
         );
         if !watch_roots.is_empty() {
             crate::watch::spawn_watchers(Arc::clone(&filesystem), watch_roots, include, exclude);

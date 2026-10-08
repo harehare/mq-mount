@@ -31,14 +31,15 @@ docs/ (a directory        ->  /docs/guide/a/...  and  /docs/api/b/...
 
 # Title (inside a.md)     ->  /a/content.md          (a.md's own preamble, if any)
                               /a/Title/content.md    (Title's own body)
-## Sub A                  ->  /a/Title/Sub-A/content.md
-## Sub A                  ->  /a/Title/Sub-A-2/content.md  (duplicate titles get -2, -3, ...)
+## Sub A                  ->  /a/Title/Sub A/content.md    (the heading text, as-is: spaces kept,
+                                                             only `/` and `\` replaced with `-`)
+## Sub A                  ->  /a/Title/Sub A-2/content.md  (duplicate titles get -2, -3, ...)
 ---
 front matter
 ---                       ->  /a/_frontmatter.yaml (or _frontmatter.toml)
 ```
 
-- With `--toc`, every mounted file also gets a read-only `/a/_toc.md`: a linked Markdown list of its whole heading tree (e.g. `- [Sub A](Title/Sub A/content.md)`). Lets an agent see the structure in one read instead of walking every directory with `ls`. The mount root also gets a read-only `/_toc.md` aggregating every mounted file's heading tree in one place, under a `## <file>` heading each.
+- With `--toc`, every mounted file also gets a read-only `/a/_toc.md`: a linked Markdown list of its whole heading tree (e.g. `- [Sub A](<Title/Sub A/content.md>)`). Lets an agent see the structure in one read instead of walking every directory with `ls`. The mount root also gets a read-only `/_toc.md` aggregating every mounted file's heading tree in one place, under a `## <file>` heading each.
 - A section's `content.md` holds only its own body — text up to the *next* heading of any depth, not its subsections'.
 - Nesting follows heading depth and document order, not indentation. Typing `#` inside a deeply-nested section's `content.md` creates a new top-level directory *within that file* on save, not a nested one.
 - The top-level, per-file/per-directory layout is fixed at mount time: `mkdir`/`rmdir`/`rename` there, or moving `content.md` between two mounted files, aren't supported (`EPERM`/`ENOENT`/`EOPNOTSUPP`).
@@ -71,7 +72,9 @@ front matter
 
 ## Installation
 
-**macOS/Linux**: no system packages required; mounting uses the OS's built-in NFS client.
+**macOS**: no system packages required; mounting uses the OS's built-in NFS client.
+
+**Linux**: mounting uses the kernel's NFS client, which needs the `mount.nfs` helper (`nfs-common` on Debian/Ubuntu, `nfs-utils` on Fedora/Arch) and **root**: run `mq-mount` with `sudo`. Files written through the mount are still written by the `mq-mount` process, so they end up owned by root only if they didn't exist before.
 
 **Windows**: install [WinFSP](https://winfsp.dev) first — Windows' own built-in NFS client is Pro/Enterprise/Server-only and doesn't support the custom ports this tool needs. Backend unverified on a real Windows machine; see [Known limitations](#known-limitations).
 
@@ -106,7 +109,8 @@ cargo build --release
 ## Usage
 
 ```sh
-mkdir /tmp/doc-mount
+# The mount directory is created if it doesn't exist yet.
+# On Linux, prefix each mounting command with `sudo` (see Installation).
 # Mounts are read-only by default; pass --write to edit the source file(s).
 mq-mount README.md CHANGELOG.md /tmp/doc-mount --write
 # or mount every .md file under a directory tree, structure mirrored:
