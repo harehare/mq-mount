@@ -1392,6 +1392,34 @@ mod tests {
     }
 
     #[test]
+    fn saving_one_section_leaves_the_rest_of_the_source_byte_identical() {
+        let src = "# Title\n\n* a\n* b\n\n|x|y|\n|-|-|\n|1|2|\n\n## Edit me\nold\n\n## Keep\n\n+ k\n";
+        let (fs, dir, file_ino) = mounted(src);
+        let content_ino = lookup_path(&fs, file_ino, &["Title", "Edit me", document::CONTENT_FILE]);
+
+        fs.truncate(content_ino).unwrap();
+        fs.write(content_ino, 0, b"new\n").unwrap();
+        fs.flush();
+
+        let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
+        assert_eq!(persisted, src.replace("## Edit me\nold\n", "## Edit me\n\nnew\n"));
+    }
+
+    #[test]
+    fn resaving_unchanged_content_does_not_touch_the_source() {
+        let src = "# Title\n\n* a\n* b\n\n|x|y|\n|-|-|\n|1|2|\n";
+        let (fs, dir, file_ino) = mounted(src);
+        let content_ino = lookup_path(&fs, file_ino, &["Title", document::CONTENT_FILE]);
+        let (body, _) = fs.read(content_ino, 0, 4096).unwrap();
+
+        fs.truncate(content_ino).unwrap();
+        fs.write(content_ino, 0, &body).unwrap();
+        fs.flush();
+
+        assert_eq!(std::fs::read_to_string(dir.path().join("doc.md")).unwrap(), src);
+    }
+
+    #[test]
     fn write_defers_the_disk_write_until_flush() {
         let (fs, dir, file_ino) = mounted("# Title\n\noriginal\n");
         let content_ino = lookup_path(&fs, file_ino, &["Title", document::CONTENT_FILE]);

@@ -220,15 +220,129 @@ pub enum MutationError {
 /// recomputed on demand, never mutated independently.
 pub struct Document {
     markdown: Markdown,
+    /// The source text this document was parsed from, split into the same
+    /// chunks [`chunk_starts`] cuts the node list into. Lets [`Self::render`]
+    /// write back an unedited chunk's original bytes verbatim instead of
+    /// mq-markdown's normalized rendering of it. `None` if the parse didn't
+    /// carry usable positions, in which case every render is a full one.
+    baseline: Option<Baseline>,
+}
+
+/// See [`Document::baseline`].
+struct Baseline {
+    source: String,
+    /// Byte range in `source` each original chunk occupies, in order. Chunk
+    /// `i` ends where chunk `i + 1` starts, so the blank lines between two
+    /// chunks belong to the earlier one, and the first chunk always starts
+    /// at byte 0 (keeping any leading blank lines).
+    chunk_bytes: Vec<Range<usize>>,
+    /// Each original chunk's standalone rendering, mapped back to every chunk
+    /// index that renders that way. A current chunk is "unedited" exactly
+    /// when its own rendering is found here — compared by content rather
+    /// than by tracking identity through mutations, so an edit that's later
+    /// undone (or a `truncate` + rewrite of identical text, as editors do)
+    /// still lands back on the original bytes.
+    by_render: FxHashMap<String, Vec<usize>>,
+}
+
+impl Baseline {
+    fn new(source: &str, nodes: &[Node]) -> Option<Self> {
+        let mut line_starts = vec![0usize];
+        line_starts.extend(source.match_indices('\n').map(|(i, _)| i + 1));
+        let line_offset = |line: usize| line_starts.get(line.checked_sub(1)?).copied();
+
+        let starts = chunk_starts(nodes);
+        let mut chunk_bytes = Vec::with_capacity(starts.len());
+        let mut by_render: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        for (i, range) in chunk_ranges(&starts, nodes.len()).enumerate() {
+            let start = if i == 0 {
+                0
+            } else {
+                line_offset(nodes[range.start].position()?.start.line)?
+            };
+            let end = match starts.get(i + 1) {
+                Some(&next) => line_offset(nodes[next].position()?.start.line)?,
+                None => source.len(),
+            };
+            if start > end {
+                return None;
+            }
+            chunk_bytes.push(start..end);
+            by_render.entry(render_nodes(&nodes[range])).or_default().push(i);
+        }
+        Some(Self {
+            source: source.to_string(),
+            chunk_bytes,
+            by_render,
+        })
+    }
+
+    /// The original chunk to reuse for a current chunk that renders as
+    /// `rendered`: the first candidate after `prev` (the last one reused) in
+    /// document order, so duplicate-looking sections keep their own bytes,
+    /// falling back to the first candidate for a section moved earlier.
+    fn find(&self, rendered: &str, prev: Option<usize>) -> Option<usize> {
+        let candidates = self.by_render.get(rendered)?;
+        let after = prev.map_or(0, |p| p + 1);
+        candidates
+            .iter()
+            .copied()
+            .find(|&k| k >= after)
+            .or_else(|| candidates.first().copied())
+    }
+}
+
+/// Node indices at which the document is cut into independently
+/// re-renderable chunks: the front matter, the preamble before the first
+/// heading, and each heading (with its own content, up to the next heading
+/// of any depth). Headings always start a fresh block, so a chunk never
+/// splits a list, table, or paragraph.
+fn chunk_starts(nodes: &[Node]) -> Vec<usize> {
+    let mut starts = Vec::new();
+    if !nodes.is_empty() {
+        starts.push(0);
+    }
+    if matches!(nodes.first(), Some(Node::Yaml(_) | Node::Toml(_))) && nodes.len() > 1 {
+        starts.push(1);
+    }
+    starts.extend(
+        nodes
+            .iter()
+            .enumerate()
+            .filter(|(i, n)| *i > 0 && matches!(n, Node::Heading(_)))
+            .map(|(i, _)| i),
+    );
+    starts.dedup();
+    starts
+}
+
+fn chunk_ranges(starts: &[usize], len: usize) -> impl Iterator<Item = Range<usize>> + '_ {
+    starts
+        .iter()
+        .enumerate()
+        .map(move |(i, &start)| start..starts.get(i + 1).copied().unwrap_or(len))
+}
+
+fn render_nodes(nodes: &[Node]) -> String {
+    Markdown::new(nodes.to_vec()).to_string()
+}
+
+/// Appends whatever newlines `out` still needs to end in a blank line, so
+/// the next chunk starts a fresh block.
+fn push_block_separator(out: &mut String) {
+    if out.is_empty() || out.ends_with("\n\n") {
+        return;
+    }
+    out.push_str(if out.ends_with('\n') { "\n" } else { "\n\n" });
 }
 
 impl Document {
     pub fn parse(source: &str) -> Result<Self, MutationError> {
-        Ok(Self {
-            markdown: source
-                .parse::<Markdown>()
-                .map_err(|e| MutationError::Parse(e.to_string()))?,
-        })
+        let markdown = source
+            .parse::<Markdown>()
+            .map_err(|e| MutationError::Parse(e.to_string()))?;
+        let baseline = Baseline::new(source, &markdown.nodes);
+        Ok(Self { markdown, baseline })
     }
 
     pub fn tree(&self) -> SectionTree {
@@ -265,14 +379,57 @@ impl Document {
         (self_matches || !section.children.is_empty()).then_some(section)
     }
 
-    /// Full-document render, used both to serve reads of a fresh mount and to
-    /// persist every mutation back to the source file.
+    /// Full-document render, persisted back to the source file on every
+    /// flush. Each chunk (see [`chunk_starts`]) whose content is unchanged
+    /// since parsing is copied from the original source byte for byte; only
+    /// edited chunks go through mq-markdown's normalizing renderer. So an
+    /// unedited document renders to exactly its source.
     pub fn render(&self) -> String {
-        self.markdown.to_string()
+        let Some(base) = &self.baseline else {
+            return self.markdown.to_string();
+        };
+        let nodes = &self.markdown.nodes;
+        let starts = chunk_starts(nodes);
+        let mut out = String::new();
+        // The original chunk emitted immediately before (reset by an edited
+        // chunk), vs. the last original chunk emitted at all.
+        let mut prev: Option<usize> = None;
+        let mut last_reused: Option<usize> = None;
+        for range in chunk_ranges(&starts, nodes.len()) {
+            let rendered = render_nodes(&nodes[range]);
+            match base.find(&rendered, last_reused) {
+                Some(k) => {
+                    // Adjacent original chunks already carry the exact gap
+                    // between them; anything else needs its own separator.
+                    if prev.is_none_or(|p| p + 1 != k) {
+                        push_block_separator(&mut out);
+                    }
+                    out.push_str(&base.source[base.chunk_bytes[k].clone()]);
+                    prev = Some(k);
+                    last_reused = Some(k);
+                }
+                None if rendered.is_empty() => {}
+                None => {
+                    push_block_separator(&mut out);
+                    out.push_str(&rendered);
+                    prev = None;
+                }
+            }
+        }
+        // Only the original last chunk knows how the file originally ended;
+        // anything else ends in exactly one newline.
+        if prev != Some(base.chunk_bytes.len().wrapping_sub(1)) {
+            let trimmed = out.trim_end_matches('\n').len();
+            out.truncate(trimmed);
+            if !out.is_empty() {
+                out.push('\n');
+            }
+        }
+        out
     }
 
     pub fn render_range(&self, range: Range<usize>) -> String {
-        Markdown::new(self.markdown.nodes[range].to_vec()).to_string()
+        render_nodes(&self.markdown.nodes[range])
     }
 
     pub fn frontmatter_value(&self, node_index: usize) -> &str {
@@ -298,6 +455,12 @@ impl Document {
             .parse::<Markdown>()
             .map_err(|e| MutationError::Parse(e.to_string()))?
             .nodes;
+        // Rewriting a section with what it already says (an editor saving
+        // unchanged content) keeps the original nodes, and with them the
+        // exact spacing [`Self::render`] compares against.
+        if render_nodes(&new_nodes) == self.render_range(range.clone()) {
+            return Ok(());
+        }
         self.splice_with_reflow(range, new_nodes);
         Ok(())
     }
@@ -793,6 +956,146 @@ mod tests {
         let a = tree.find(&["Title", "A"]).expect("A survives re-parse");
         assert_eq!(reparsed.render_range(a.own_content_range.clone()).trim(), "new");
         assert!(tree.find(&["Title", "B"]).is_some(), "B survives re-parse");
+    }
+
+    /// Formatting mq-markdown's renderer would normalize: `*` bullets, a
+    /// padless table, a run of blank lines, `+` bullets, and no trailing
+    /// newline at the very end.
+    const QUIRKY: &str = "---\ntitle:   x\n---\n\n# Title\n\n* one\n* two\n\n|a|b|\n|-|-|\n|1|2|\n\n\n\n## A\nold a\n\n## B\n\n+ b1\n+ b2\n\n## C\n\n1) c\n2) d";
+
+    fn section_range(doc: &Document, path: &[&str]) -> Range<usize> {
+        doc.tree().find(path).unwrap().own_content_range.clone()
+    }
+
+    #[test]
+    fn render_of_an_unedited_document_is_its_exact_source() {
+        let doc = Document::parse(QUIRKY).unwrap();
+        assert_eq!(doc.render(), QUIRKY);
+
+        for src in [
+            "",
+            "\n\n# Leading blank lines\n",
+            "plain text, no headings",
+            "Setext\n======\n\nbody\n",
+        ] {
+            assert_eq!(Document::parse(src).unwrap().render(), src);
+        }
+    }
+
+    #[test]
+    fn editing_one_section_leaves_every_other_section_byte_identical() {
+        let mut doc = Document::parse(QUIRKY).unwrap();
+        let range = section_range(&doc, &["Title", "B"]);
+        doc.replace_section_content(range, "new b\n").unwrap();
+
+        let out = doc.render();
+        let expected = QUIRKY.replace("+ b1\n+ b2\n\n", "new b\n\n");
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn editing_the_last_section_keeps_everything_before_it() {
+        let mut doc = Document::parse(QUIRKY).unwrap();
+        let range = section_range(&doc, &["Title", "C"]);
+        doc.replace_section_content(range, "changed\n").unwrap();
+
+        let out = doc.render();
+        let (before, _) = QUIRKY.split_once("## C").unwrap();
+        assert_eq!(out, format!("{before}## C\n\nchanged\n"));
+    }
+
+    #[test]
+    fn rewriting_a_section_with_its_own_content_is_a_byte_exact_no_op() {
+        let mut doc = Document::parse(QUIRKY).unwrap();
+        for path in [&["Title"][..], &["Title", "A"], &["Title", "B"], &["Title", "C"]] {
+            let range = section_range(&doc, path);
+            let body = doc.render_range(range.clone());
+            doc.replace_section_content(range, &body).unwrap();
+        }
+        assert_eq!(doc.render(), QUIRKY);
+    }
+
+    #[test]
+    fn truncating_then_restoring_a_section_lands_back_on_the_original_bytes() {
+        let mut doc = Document::parse(QUIRKY).unwrap();
+        let range = section_range(&doc, &["Title"]);
+        let body = doc.render_range(range.clone());
+        doc.replace_section_content(range, "").unwrap();
+        assert_ne!(doc.render(), QUIRKY);
+
+        let range = section_range(&doc, &["Title"]);
+        doc.replace_section_content(range, &body).unwrap();
+        assert_eq!(doc.render(), QUIRKY);
+    }
+
+    #[test]
+    fn structural_edits_leave_unrelated_sections_byte_identical() {
+        let title_chunk = "# Title\n\n* one\n* two\n\n|a|b|\n|-|-|\n|1|2|\n\n\n\n";
+        let b_chunk = "## B\n\n+ b1\n+ b2\n\n";
+
+        // Insert a new heading at the end of Title.
+        let mut doc = Document::parse(QUIRKY).unwrap();
+        let tree = doc.tree();
+        doc.insert_heading(tree.find(&["Title"]).unwrap(), "New").unwrap();
+        let out = doc.render();
+        assert!(out.contains(title_chunk), "{out}");
+        assert!(out.contains(b_chunk), "{out}");
+        assert!(out.contains("|1|2|\n\n\n\n## New\n\n## A\nold a\n"), "{out}");
+
+        // Rename B.
+        let mut doc = Document::parse(QUIRKY).unwrap();
+        let tree = doc.tree();
+        doc.rename_heading(tree.find(&["Title", "B"]).unwrap(), "Bee").unwrap();
+        let out = doc.render();
+        assert!(out.contains(title_chunk), "{out}");
+        assert!(out.contains("## Bee\n\n- b1\n- b2\n"), "{out}");
+        assert!(out.ends_with("## C\n\n1) c\n2) d"), "{out}");
+
+        // Delete C (empty it first: rmdir is POSIX-strict).
+        let mut doc = Document::parse(QUIRKY).unwrap();
+        let range = section_range(&doc, &["Title", "C"]);
+        doc.replace_section_content(range, "").unwrap();
+        let tree = doc.tree();
+        doc.remove_heading(tree.find(&["Title", "C"]).unwrap()).unwrap();
+        let out = doc.render();
+        assert_eq!(out, QUIRKY.split_once("## C").unwrap().0.trim_end().to_string() + "\n");
+
+        // Move A under B: A's depth changes (re-rendered), the rest is kept.
+        let mut doc = Document::parse(QUIRKY).unwrap();
+        let tree = doc.tree();
+        let a = tree.find(&["Title", "A"]).unwrap();
+        let b = tree.find(&["Title", "B"]).unwrap();
+        doc.move_heading(a, b, "A").unwrap();
+        let out = doc.render();
+        assert!(out.contains(title_chunk), "{out}");
+        assert!(out.contains("### A\n"), "{out}");
+        assert!(out.ends_with("## C\n\n1) c\n2) d"), "{out}");
+        assert!(
+            Document::parse(&out)
+                .unwrap()
+                .tree()
+                .find(&["Title", "B", "A"])
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn editing_front_matter_keeps_the_body_byte_identical() {
+        let mut doc = Document::parse(QUIRKY).unwrap();
+        doc.set_frontmatter(0, "title: y".to_string());
+        let out = doc.render();
+        let (_, body) = QUIRKY.split_once("---\n\n").unwrap();
+        assert!(out.starts_with("---\ntitle: y\n---\n"), "{out}");
+        assert!(out.ends_with(body), "{out}");
+    }
+
+    #[test]
+    fn duplicate_looking_sections_each_keep_their_own_bytes() {
+        let src = "# X\n\n* same\n\n# Y\n\n# X\n\n- same\n";
+        let mut doc = Document::parse(src).unwrap();
+        let range = section_range(&doc, &["Y"]);
+        doc.replace_section_content(range, "y\n").unwrap();
+        assert_eq!(doc.render(), "# X\n\n* same\n\n# Y\n\ny\n\n# X\n\n- same\n");
     }
 }
 
