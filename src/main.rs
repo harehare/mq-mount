@@ -90,9 +90,13 @@ mod app {
         /// Stop a running mount (background or foreground) at this mountpoint and exit
         #[arg(long, value_name = "MOUNTPOINT", conflicts_with_all = ["paths", "write", "allow_other", "watch", "toc", "full", "slug", "include", "exclude", "filter", "backup", "on_conflict", "background", "list"])]
         stop: Option<PathBuf>,
-        /// List currently running background mounts and exit
+        /// List currently running mounts (background or foreground) and exit
         #[arg(long, conflicts_with_all = ["paths", "write", "allow_other", "watch", "toc", "full", "slug", "include", "exclude", "filter", "backup", "on_conflict", "background", "stop"])]
         list: bool,
+        /// With --list, print the mounts as a JSON array of
+        /// `{pid, mountpoint, sources, log}` objects
+        #[arg(long, requires = "list")]
+        json: bool,
         /// Enable verbose (debug) logging
         #[arg(short, long)]
         verbose: bool,
@@ -111,7 +115,7 @@ mod app {
         }
 
         if cli.list {
-            return crate::daemon::list();
+            return crate::daemon::list(cli.json);
         }
 
         if cli.paths.len() < 2 {
@@ -183,7 +187,11 @@ mod app {
         }
         spawn_background_sync(Arc::clone(&filesystem));
 
-        let _pidfile = crate::daemon::PidFileGuard::create(mountpoint)
+        let source_args: Vec<PathBuf> = sources
+            .iter()
+            .map(|s| s.canonicalize().unwrap_or_else(|_| s.clone()))
+            .collect();
+        let _pidfile = crate::daemon::PidFileGuard::create(mountpoint, &source_args)
             .map_err(|e| miette::miette!("failed to write pid file: {e}"))?;
 
         #[cfg(unix)]

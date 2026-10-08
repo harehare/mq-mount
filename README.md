@@ -151,8 +151,11 @@ mq-mount --stop /tmp/doc-mount
 # A background mount also exits on its own if the volume is unmounted some
 # other way (Finder/Explorer eject, diskutil/umount) — no orphaned process.
 
-# List every currently running background mount (like `docker ps`):
+# List every currently running mount and its sources (like `docker ps`):
 mq-mount --list
+# ...or as JSON, for scripts and agents:
+mq-mount --list --json
+# [{"pid":4242,"mountpoint":"/tmp/doc-mount","sources":["/home/me/docs"],"log":"/tmp/mq-mount/….log"}]
 
 # Snapshot each source file's pre-edit bytes to <file>.orig before its first write:
 mq-mount README.md /tmp/doc-mount --write --backup
@@ -222,7 +225,10 @@ Options:
                             running once this process exits
       --stop <MOUNTPOINT>  Stop a running mount (background or foreground)
                             at this mountpoint and exit
-      --list               List currently running background mounts and exit
+      --list               List currently running mounts (background or
+                            foreground) and exit
+      --json               With --list, print the mounts as a JSON array of
+                            `{pid, mountpoint, sources, log}` objects
   -v, --verbose            Enable verbose (debug) logging
   -h, --help               Print help
   -V, --version            Print version
