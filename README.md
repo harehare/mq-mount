@@ -165,6 +165,22 @@ mq-mount README.md /tmp/doc-mount --filter '.h2'
 ls /tmp/doc-mount/README   # only depth-2 headings (and their ancestors) appear
 ```
 
+### Config file
+
+Options you always use can live in a `.mq-mount.toml`, looked up in the current directory, then in the first source's directory (or passed explicitly with `--config <path>`; `--no-config` skips it). Keys mirror the long flags; command-line flags override the file:
+
+```toml
+write = true
+toc = true
+full = true
+slug = "kebab"           # raw | kebab
+on-conflict = "keep-both" # keep-both | reject
+exclude = ["**/draft-*.md"]
+# Also: allow-other, watch, backup, filter, include
+```
+
+A boolean the file turns on can't be turned off from the command line; use `--no-config` for that. Unknown keys are an error, so typos don't go unnoticed.
+
 ### Options
 
 ```
@@ -213,6 +229,11 @@ Options:
       --backup             Before the first write to each source file, save
                             its pre-edit bytes to a sibling `<file>.orig`
                             (skipped if one already exists)
+      --config <PATH>      Read default options from this TOML file instead
+                            of looking for `.mq-mount.toml` in the current
+                            directory, then in the first source's directory.
+                            Command-line flags override it
+      --no-config          Don't read any `.mq-mount.toml`
       --on-conflict <POLICY>
                            What to do when a pending edit can't be written
                             because the source file changed on disk in the

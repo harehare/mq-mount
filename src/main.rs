@@ -7,6 +7,9 @@ mod vfs;
 mod backend;
 
 #[cfg(feature = "mount")]
+mod config;
+
+#[cfg(feature = "mount")]
 mod daemon;
 
 #[cfg(feature = "mount")]
@@ -23,6 +26,7 @@ mod app {
 
     use clap::Parser;
 
+    use crate::config::Config;
     use crate::document::SlugStyle;
     use crate::fs::{ConflictPolicy, MountOptions, MqFs};
 
@@ -57,8 +61,9 @@ mod app {
         /// How a heading's text becomes its directory name: `raw` keeps it
         /// as-is (spaces and punctuation included); `kebab` lowercases it,
         /// turns whitespace into `-`, and drops other punctuation
-        #[arg(long, value_enum, value_name = "STYLE", default_value_t = SlugStyle::Raw)]
-        slug: SlugStyle,
+        /// [default: raw]
+        #[arg(long, value_enum, value_name = "STYLE")]
+        slug: Option<SlugStyle>,
         /// Only mount .md files under a directory argument whose path
         /// (relative to that argument) matches this glob; repeatable
         #[arg(long = "include", value_name = "GLOB")]
@@ -82,16 +87,25 @@ mod app {
         /// source file changed on disk in the meantime: `keep-both` saves
         /// the mount's version to a sibling `<file>.conflict-<time>` and
         /// loads the one on disk; `reject` keeps failing until a remount
-        #[arg(long, value_enum, value_name = "POLICY", default_value_t = ConflictPolicy::KeepBoth)]
-        on_conflict: ConflictPolicy,
+        /// [default: keep-both]
+        #[arg(long, value_enum, value_name = "POLICY")]
+        on_conflict: Option<ConflictPolicy>,
+        /// Read default options from this TOML file instead of looking for
+        /// `.mq-mount.toml` in the current directory, then in the first
+        /// source's directory. Command-line flags override it
+        #[arg(long, value_name = "PATH", conflicts_with = "no_config")]
+        config: Option<PathBuf>,
+        /// Don't read any `.mq-mount.toml`
+        #[arg(long)]
+        no_config: bool,
         /// Run detached from the terminal; the child keeps running once this process exits
         #[arg(short = 'd', long)]
         background: bool,
         /// Stop a running mount (background or foreground) at this mountpoint and exit
-        #[arg(long, value_name = "MOUNTPOINT", conflicts_with_all = ["paths", "write", "allow_other", "watch", "toc", "full", "slug", "include", "exclude", "filter", "backup", "on_conflict", "background", "list"])]
+        #[arg(long, value_name = "MOUNTPOINT", conflicts_with_all = ["paths", "write", "allow_other", "watch", "toc", "full", "slug", "include", "exclude", "filter", "backup", "on_conflict", "config", "no_config", "background", "list"])]
         stop: Option<PathBuf>,
         /// List currently running mounts (background or foreground) and exit
-        #[arg(long, conflicts_with_all = ["paths", "write", "allow_other", "watch", "toc", "full", "slug", "include", "exclude", "filter", "backup", "on_conflict", "background", "stop"])]
+        #[arg(long, conflicts_with_all = ["paths", "write", "allow_other", "watch", "toc", "full", "slug", "include", "exclude", "filter", "backup", "on_conflict", "config", "no_config", "background", "stop"])]
         list: bool,
         /// With --list, print the mounts as a JSON array of
         /// `{pid, mountpoint, sources, log}` objects
@@ -139,14 +153,17 @@ mod app {
             .canonicalize()
             .map_err(|e| miette::miette!("failed to resolve {}: {e}", mountpoint.display()))?;
 
-        let readonly = effective_readonly(cli.write, cli.filter.is_some());
-        if cli.write && cli.filter.is_some() {
+        let config = load_config(&cli, sources)?;
+        let opts = Resolved::merge(&cli, config)?;
+
+        let readonly = effective_readonly(opts.write, opts.filter.is_some());
+        if opts.write && opts.filter.is_some() {
             tracing::warn!("--filter always mounts read-only; ignoring --write");
         }
-        let heading_filter = cli.filter.as_deref().map(crate::query_filter::compile).transpose()?;
+        let heading_filter = opts.filter.as_deref().map(crate::query_filter::compile).transpose()?;
 
-        let include = compile_globs(&cli.include)?;
-        let exclude = compile_globs(&cli.exclude)?;
+        let include = compile_globs(&opts.include)?;
+        let exclude = compile_globs(&opts.exclude)?;
 
         let entries = collect_entries(sources, &include, &exclude)?;
         let entries = entries
@@ -160,7 +177,7 @@ mod app {
         let file_count = entries.len();
         let name = mount_name(&entries);
 
-        let watch_roots = watch_roots_for(sources, cli.watch)?;
+        let watch_roots = watch_roots_for(sources, opts.watch)?;
 
         if cli.background {
             return crate::daemon::spawn_background(mountpoint);
@@ -171,13 +188,13 @@ mod app {
                 entries,
                 MountOptions {
                     readonly,
-                    allow_other: cli.allow_other,
-                    toc: cli.toc,
-                    backup: cli.backup,
+                    allow_other: opts.allow_other,
+                    toc: opts.toc,
+                    backup: opts.backup,
                     filter: heading_filter,
-                    on_conflict: cli.on_conflict,
-                    full: cli.full,
-                    slug: cli.slug,
+                    on_conflict: opts.on_conflict,
+                    full: opts.full,
+                    slug: opts.slug,
                 },
             )
             .map_err(|e| miette::miette!("failed to read source file(s): {e}"))?,
@@ -198,6 +215,80 @@ mod app {
         return crate::backend::nfs::run(filesystem, mountpoint, file_count, readonly, &name);
         #[cfg(windows)]
         return crate::backend::winfsp::run(filesystem, mountpoint, file_count, readonly, &name);
+    }
+
+    /// `--config`, else a discovered `.mq-mount.toml` (see
+    /// [`Config::discover`]), else nothing (`--no-config`, or none found).
+    fn load_config(cli: &Cli, sources: &[PathBuf]) -> miette::Result<Config> {
+        if cli.no_config {
+            return Ok(Config::default());
+        }
+        let path = match &cli.config {
+            Some(path) => Some(path.clone()),
+            None => {
+                let cwd = std::env::current_dir()
+                    .map_err(|e| miette::miette!("failed to read the current directory: {e}"))?;
+                Config::discover(&cwd, sources)
+            }
+        };
+        match path {
+            Some(path) => {
+                tracing::info!("using options from {}", path.display());
+                Config::load(&path)
+            }
+            None => Ok(Config::default()),
+        }
+    }
+
+    /// Mount options after layering command-line flags over the config file.
+    /// A boolean flag can only turn an option on, so one the config file
+    /// turns on can't be turned off from the command line; `--no-config`
+    /// is the way out.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Resolved {
+        write: bool,
+        allow_other: bool,
+        watch: bool,
+        toc: bool,
+        full: bool,
+        backup: bool,
+        slug: SlugStyle,
+        on_conflict: ConflictPolicy,
+        filter: Option<String>,
+        include: Vec<String>,
+        exclude: Vec<String>,
+    }
+
+    impl Resolved {
+        fn merge(cli: &Cli, config: Config) -> miette::Result<Self> {
+            let flag = |set: bool, default: Option<bool>| set || default.unwrap_or(false);
+            let list = |set: &[String], default: Option<Vec<String>>| {
+                if set.is_empty() {
+                    default.unwrap_or_default()
+                } else {
+                    set.to_vec()
+                }
+            };
+            Ok(Self {
+                write: flag(cli.write, config.write),
+                allow_other: flag(cli.allow_other, config.allow_other),
+                watch: flag(cli.watch, config.watch),
+                toc: flag(cli.toc, config.toc),
+                full: flag(cli.full, config.full),
+                backup: flag(cli.backup, config.backup),
+                slug: match cli.slug {
+                    Some(slug) => slug,
+                    None => Config::value_enum(config.slug.as_deref(), "slug")?.unwrap_or_default(),
+                },
+                on_conflict: match cli.on_conflict {
+                    Some(policy) => policy,
+                    None => Config::value_enum(config.on_conflict.as_deref(), "on-conflict")?.unwrap_or_default(),
+                },
+                filter: cli.filter.clone().or(config.filter),
+                include: list(&cli.include, config.include),
+                exclude: list(&cli.exclude, config.exclude),
+            })
+        }
     }
 
     /// Coalesces bursts of small writes into one render+disk-write per file
@@ -399,6 +490,58 @@ mod app {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn command_line_flags_override_the_config_file() {
+            let config = Config {
+                toc: Some(true),
+                slug: Some("kebab".into()),
+                on_conflict: Some("reject".into()),
+                filter: Some(".h1".into()),
+                include: Some(vec!["a/*.md".into()]),
+                exclude: Some(vec!["x.md".into()]),
+                ..Default::default()
+            };
+            let cli = Cli::parse_from([
+                "mq-mount",
+                "--slug",
+                "raw",
+                "--filter",
+                ".h2",
+                "--include",
+                "b/*.md",
+                "--write",
+                "a.md",
+                "/mnt",
+            ]);
+            let opts = Resolved::merge(&cli, config).unwrap();
+            assert!(opts.toc, "config-only option applies");
+            assert!(opts.write, "flag-only option applies");
+            assert_eq!(opts.slug, SlugStyle::Raw);
+            assert_eq!(opts.on_conflict, ConflictPolicy::Reject);
+            assert_eq!(opts.filter.as_deref(), Some(".h2"));
+            assert_eq!(opts.include, vec!["b/*.md".to_string()]);
+            assert_eq!(opts.exclude, vec!["x.md".to_string()]);
+        }
+
+        #[test]
+        fn without_a_config_file_everything_defaults() {
+            let cli = Cli::parse_from(["mq-mount", "a.md", "/mnt"]);
+            let opts = Resolved::merge(&cli, Config::default()).unwrap();
+            assert!(!opts.write && !opts.toc && !opts.full && !opts.watch);
+            assert_eq!(opts.slug, SlugStyle::Raw);
+            assert_eq!(opts.on_conflict, ConflictPolicy::KeepBoth);
+        }
+
+        #[test]
+        fn a_bad_enum_value_in_the_config_file_is_an_error() {
+            let cli = Cli::parse_from(["mq-mount", "a.md", "/mnt"]);
+            let config = Config {
+                slug: Some("snake".into()),
+                ..Default::default()
+            };
+            assert!(Resolved::merge(&cli, config).is_err());
+        }
 
         #[test]
         fn filter_forces_read_only_even_with_write() {
