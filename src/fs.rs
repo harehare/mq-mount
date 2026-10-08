@@ -98,6 +98,41 @@ fn backup_path(source_path: &std::path::Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Where [`ConflictPolicy::KeepBoth`] sets aside a local version that
+/// couldn't be written: `<file>.conflict-<unix seconds>` next to the source
+/// (with `-2`, `-3`, ... appended if that's taken). Deliberately not ending
+/// in `.md`, so a directory mount (or `--watch`) never picks it up as a
+/// new document.
+fn conflict_path(source_path: &std::path::Path) -> PathBuf {
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let mut base = source_path.as_os_str().to_owned();
+    base.push(format!(".conflict-{secs}"));
+    let mut candidate = PathBuf::from(&base);
+    let mut n = 2;
+    while candidate.exists() {
+        let mut name = base.clone();
+        name.push(format!("-{n}"));
+        candidate = PathBuf::from(name);
+        n += 1;
+    }
+    candidate
+}
+
+/// What to do when a local edit can't be flushed because the source file
+/// changed on disk since the mount last read it (`--on-conflict`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum ConflictPolicy {
+    /// Save the mount's version to a sibling `<file>.conflict-<time>` file,
+    /// then load the version on disk so the mount keeps working.
+    #[default]
+    KeepBoth,
+    /// Keep the mount's version in memory and fail every flush until the
+    /// mount is restarted.
+    Reject,
+}
+
 struct SuperDir {
     parent: Ino,
     children: Vec<(String, Ino)>,
@@ -144,6 +179,7 @@ struct MountState {
     /// is exposed only if it (or a descendant) matches. `None` mounts every
     /// section, as before. Forces the mount read-only at the CLI layer.
     filter: Option<Arc<document::HeadingFilter>>,
+    on_conflict: ConflictPolicy,
 }
 
 impl MountState {
@@ -154,6 +190,7 @@ impl MountState {
             toc,
             backup,
             filter,
+            on_conflict,
         } = options;
         let mut next_ino = ROOT_INO + 1;
         let mut files = Vec::with_capacity(entries.len());
@@ -189,6 +226,7 @@ impl MountState {
             root_toc_ino: None,
             backup,
             filter,
+            on_conflict,
         };
         #[cfg(unix)]
         {
@@ -416,7 +454,10 @@ impl MountState {
         }
     }
 
-    /// Refuses (`VfsError::Conflict`) rather than silently overwriting a source file changed on disk since it was last read.
+    /// Never silently overwrites a source file changed on disk since it was
+    /// last read: fails with `VfsError::Conflict` instead, after (with
+    /// [`ConflictPolicy::KeepBoth`]) setting the local version aside and
+    /// reloading the external one — see [`Self::resolve_conflict`].
     fn persist(&mut self, file_idx: usize) -> Result<(), VfsError> {
         let file = &mut self.files[file_idx];
         let rendered = file.document.render();
@@ -428,11 +469,7 @@ impl MountState {
         if let (Some(known), Some(current)) = (file.last_known_mtime, current_mtime)
             && current > known
         {
-            tracing::warn!(
-                "{} changed on disk outside the mount since it was last read; refusing to overwrite it",
-                file.source_path.display()
-            );
-            return Err(VfsError::Conflict);
+            return Err(self.resolve_conflict(file_idx, &rendered));
         }
         if self.backup && !file.backed_up {
             let orig = backup_path(&file.source_path);
@@ -448,6 +485,53 @@ impl MountState {
         file.last_known_mtime = fs::metadata(&file.source_path).ok().and_then(|m| m.modified().ok());
         file.dirty = false;
         Ok(())
+    }
+
+    /// Handles a local edit that can't be written because the source changed
+    /// on disk in the meantime. With [`ConflictPolicy::KeepBoth`], the local
+    /// version (`rendered`) is saved to a sibling conflict file (see
+    /// [`conflict_path`]) and the external version is loaded in its place,
+    /// so the mount is immediately usable again instead of failing every
+    /// later write until a remount. Either way the error is returned, so the
+    /// operation that hit the conflict still fails visibly.
+    fn resolve_conflict(&mut self, file_idx: usize, rendered: &str) -> VfsError {
+        let source_path = self.files[file_idx].source_path.clone();
+        if self.on_conflict == ConflictPolicy::Reject {
+            tracing::warn!(
+                "{} changed on disk outside the mount since it was last read; refusing to overwrite it",
+                source_path.display()
+            );
+            return VfsError::Conflict;
+        }
+
+        let aside = conflict_path(&source_path);
+        if let Err(e) = fs::write(&aside, rendered) {
+            tracing::warn!(
+                "{} changed on disk outside the mount, and saving the mount's version to {} failed ({e}); \
+                 keeping it in memory, refusing to overwrite the source",
+                source_path.display(),
+                aside.display()
+            );
+            return VfsError::Conflict;
+        }
+        let file = &mut self.files[file_idx];
+        file.dirty = false;
+        // Forget the last-known mtime so the reload below can't skip it...
+        let known_mtime = file.last_known_mtime.take();
+        self.refresh_if_changed(file_idx);
+        // ...but restore it if the reload failed (e.g. the external version
+        // doesn't parse), or the next flush would overwrite that version.
+        let file = &mut self.files[file_idx];
+        if file.last_known_mtime.is_none() {
+            file.last_known_mtime = known_mtime;
+        }
+        tracing::warn!(
+            "{} changed on disk outside the mount while it had unsaved edits; \
+             saved the mount's version to {} and loaded the version on disk",
+            source_path.display(),
+            aside.display()
+        );
+        VfsError::Conflict
     }
 
     fn rebuild_and_persist(&mut self, file_idx: usize) -> Result<(), VfsError> {
@@ -812,6 +896,7 @@ pub struct MountOptions {
     pub toc: bool,
     pub backup: bool,
     pub filter: Option<Arc<document::HeadingFilter>>,
+    pub on_conflict: ConflictPolicy,
 }
 
 pub struct MqFs {
@@ -1587,9 +1672,94 @@ mod tests {
         assert!(!persisted.contains("body"), "persisted doc was: {persisted}");
     }
 
+    fn mounted_rejecting_conflicts(content: &str) -> (MqFs, tempfile::TempDir, Ino) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, content).unwrap();
+        let fs = MqFs::new(
+            vec![(path, vec!["doc".to_string()])],
+            MountOptions {
+                on_conflict: ConflictPolicy::Reject,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let file_ino = fs.lookup(ROOT_INO, "doc").unwrap();
+        (fs, dir, file_ino)
+    }
+
+    /// Simulates an external edit, mtime pushed well past mount time.
+    fn edit_externally(path: &std::path::Path, content: &str) {
+        std::fs::write(path, content).unwrap();
+        let future = SystemTime::now() + std::time::Duration::from_secs(3600);
+        std::fs::File::open(path).unwrap().set_modified(future).unwrap();
+    }
+
+    fn conflict_files(dir: &std::path::Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().contains(".conflict-"))
+            .collect()
+    }
+
+    #[test]
+    fn a_conflicting_flush_sets_the_local_version_aside_and_loads_the_external_one() {
+        let (fs, dir, file_ino) = mounted("# Title\n\noriginal\n");
+        let path = dir.path().join("doc.md");
+        let content_ino = lookup_path(&fs, file_ino, &["Title", document::CONTENT_FILE]);
+
+        fs.truncate(content_ino).unwrap();
+        fs.write(content_ino, 0, b"local edit\n").unwrap();
+        edit_externally(&path, "# Title\n\nexternal edit\n\n## Added\n");
+        fs.flush();
+
+        // The external version wins on disk and in the mount...
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# Title\n\nexternal edit\n\n## Added\n"
+        );
+        let content_ino = lookup_path(&fs, file_ino, &["Title", document::CONTENT_FILE]);
+        let (bytes, _) = fs.read(content_ino, 0, 1024).unwrap();
+        assert_eq!(bytes, b"external edit\n");
+        assert!(fs.lookup(lookup_path(&fs, file_ino, &["Title"]), "Added").is_ok());
+
+        // ...and the local edit is kept beside it, outside the `.md` namespace.
+        let aside = conflict_files(dir.path());
+        assert_eq!(aside.len(), 1);
+        assert!(aside[0].extension().is_none_or(|e| e != "md"));
+        assert!(std::fs::read_to_string(&aside[0]).unwrap().contains("local edit"));
+
+        // The mount keeps working: the next edit lands normally.
+        fs.truncate(content_ino).unwrap();
+        fs.write(content_ino, 0, b"after\n").unwrap();
+        fs.flush();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("after"));
+        assert_eq!(conflict_files(dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn a_synchronous_edit_hitting_a_conflict_still_fails_but_leaves_the_mount_usable() {
+        let (fs, dir, file_ino) = mounted("# Title\n\noriginal\n");
+        let path = dir.path().join("doc.md");
+        edit_externally(&path, "# Title\n\nexternal edit\n");
+
+        let title_ino = lookup_path(&fs, file_ino, &["Title"]);
+        assert!(matches!(fs.mkdir(title_ino, "New"), Err(VfsError::Conflict)));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# Title\n\nexternal edit\n");
+        assert!(
+            std::fs::read_to_string(&conflict_files(dir.path())[0])
+                .unwrap()
+                .contains("## New")
+        );
+
+        fs.mkdir(title_ino, "New").unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("## New"));
+    }
+
     #[test]
     fn write_refuses_to_overwrite_a_file_changed_externally_since_mount() {
-        let (fs, dir, file_ino) = mounted("# Title\n\noriginal\n");
+        let (fs, dir, file_ino) = mounted_rejecting_conflicts("# Title\n\noriginal\n");
         let content_ino = lookup_path(&fs, file_ino, &["Title", document::CONTENT_FILE]);
         let path = dir.path().join("doc.md");
 

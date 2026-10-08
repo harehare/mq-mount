@@ -65,7 +65,7 @@ front matter
 ## Known limitations
 
 - **Edited sections are normalized; everything else is byte-exact.** A flush rewrites only the chunks of the file whose content actually changed (a chunk is the front matter, the preamble before the first heading, or one heading plus its own body). Every untouched chunk is copied from the original file byte for byte, so an unedited file is never rewritten, and saving one section leaves the rest of the file untouched. An edited chunk goes through mq-markdown's renderer, which can normalize its whitespace, list markers, and table padding. Pass `--backup` to snapshot each source file's pre-edit bytes to a sibling `<file>.orig` before its first write.
-- **External changes are auto-reloaded, not merged.** An external edit is picked up on the next tick (~150ms) if there's no pending local edit. If there is, the mount refuses to overwrite it (`ESTALE`/`STATUS_FILE_LOCK_CONFLICT`) instead of silently discarding either version — unmount and remount to reconcile by hand.
+- **External changes are auto-reloaded, not merged.** An external edit is picked up on the next tick (~150ms) if there's no pending local edit. If there is, nothing is silently discarded: by default (`--on-conflict keep-both`) the mount's version is saved next to the source as `<file>.conflict-<unix time>`, the version on disk is loaded in its place, and the operation that hit the conflict fails with `ESTALE`/`STATUS_FILE_LOCK_CONFLICT`. Merge the two by hand, then keep working — no remount needed. The conflict file deliberately doesn't end in `.md`, so a directory mount never picks it up. `--on-conflict reject` restores the older behavior: keep refusing to write until you unmount and remount.
 - **A deferred write can be lost on a hard kill.** Writes are batched rather than flushed on every `write()`; a crash, `kill -9`, or forced termination can lose up to ~150ms of unflushed edits. A graceful stop (Ctrl-C, SIGTERM, `--stop`) always flushes first.
 - **External unmounts are noticed within a couple of seconds, not instantly.** macOS/Linux poll every 2s. On Windows, `--stop` forcibly terminates the process (no graceful cross-process signal); WinFSP still unmounts cleanly when its host process dies.
 - **The Windows (WinFSP) backend is unverified.** Built against WinFSP's documented API, but not yet run on a real Windows machine — see [Installation](#installation).
@@ -193,6 +193,14 @@ Options:
       --backup             Before the first write to each source file, save
                             its pre-edit bytes to a sibling `<file>.orig`
                             (skipped if one already exists)
+      --on-conflict <POLICY>
+                           What to do when a pending edit can't be written
+                            because the source file changed on disk in the
+                            meantime: `keep-both` saves the mount's version
+                            to a sibling `<file>.conflict-<time>` and loads
+                            the one on disk; `reject` keeps failing until a
+                            remount [default: keep-both] [possible values:
+                            keep-both, reject]
   -d, --background         Run detached from the terminal; the child keeps
                             running once this process exits
       --stop <MOUNTPOINT>  Stop a running mount (background or foreground)

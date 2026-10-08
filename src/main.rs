@@ -23,7 +23,7 @@ mod app {
 
     use clap::Parser;
 
-    use crate::fs::{MountOptions, MqFs};
+    use crate::fs::{ConflictPolicy, MountOptions, MqFs};
 
     /// Mount one or more Markdown files (or directories of them) as a
     /// virtual filesystem: each file gets a top-level directory named after
@@ -68,14 +68,20 @@ mod app {
         /// bytes to a sibling `<file>.orig` (skipped if one already exists)
         #[arg(long)]
         backup: bool,
+        /// What to do when a pending edit can't be written because the
+        /// source file changed on disk in the meantime: `keep-both` saves
+        /// the mount's version to a sibling `<file>.conflict-<time>` and
+        /// loads the one on disk; `reject` keeps failing until a remount
+        #[arg(long, value_enum, value_name = "POLICY", default_value_t = ConflictPolicy::KeepBoth)]
+        on_conflict: ConflictPolicy,
         /// Run detached from the terminal; the child keeps running once this process exits
         #[arg(short = 'd', long)]
         background: bool,
         /// Stop a running mount (background or foreground) at this mountpoint and exit
-        #[arg(long, value_name = "MOUNTPOINT", conflicts_with_all = ["paths", "write", "allow_other", "watch", "toc", "include", "exclude", "filter", "backup", "background", "list"])]
+        #[arg(long, value_name = "MOUNTPOINT", conflicts_with_all = ["paths", "write", "allow_other", "watch", "toc", "include", "exclude", "filter", "backup", "on_conflict", "background", "list"])]
         stop: Option<PathBuf>,
         /// List currently running background mounts and exit
-        #[arg(long, conflicts_with_all = ["paths", "write", "allow_other", "watch", "toc", "include", "exclude", "filter", "backup", "background", "stop"])]
+        #[arg(long, conflicts_with_all = ["paths", "write", "allow_other", "watch", "toc", "include", "exclude", "filter", "backup", "on_conflict", "background", "stop"])]
         list: bool,
         /// Enable verbose (debug) logging
         #[arg(short, long)]
@@ -155,6 +161,7 @@ mod app {
                     toc: cli.toc,
                     backup: cli.backup,
                     filter: heading_filter,
+                    on_conflict: cli.on_conflict,
                 },
             )
             .map_err(|e| miette::miette!("failed to read source file(s): {e}"))?,
