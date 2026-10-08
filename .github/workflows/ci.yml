@@ -37,3 +37,21 @@ jobs:
       - run: cargo build --all-features
       - run: cargo test --all-features
       - run: cargo test --no-default-features
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install the NFS client
+        run: sudo apt-get update && sudo apt-get install -y nfs-common
+      - name: Build end-to-end tests
+        run: cargo test --all-features --test e2e --no-run
+      # Linux NFS mounts need root. Only the already-built test binary runs
+      # under sudo, so nothing in target/ ends up root-owned.
+      - name: Run end-to-end tests against a real mount
+        run: |
+          bin=$(cargo test --all-features --test e2e --no-run --message-format=json \
+            | jq -r 'select(.profile.test == true and .target.name == "e2e") | .executable')
+          sudo MQ_MOUNT_E2E=1 "$bin" --test-threads=1

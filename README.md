@@ -264,6 +264,10 @@ cargo test --no-default-features
 # Full build
 cargo build
 cargo clippy
+
+# End-to-end tests against a real mount (skipped unless MQ_MOUNT_E2E=1;
+# Linux needs nfs-common and root):
+sudo -E env "PATH=$PATH" MQ_MOUNT_E2E=1 cargo test --test e2e -- --test-threads=1
 ```
 
 ## License
