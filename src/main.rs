@@ -23,6 +23,7 @@ mod app {
 
     use clap::Parser;
 
+    use crate::document::SlugStyle;
     use crate::fs::{ConflictPolicy, MountOptions, MqFs};
 
     /// Mount one or more Markdown files (or directories of them) as a
@@ -49,6 +50,15 @@ mod app {
         /// its whole heading tree with links to each section's content.md
         #[arg(long)]
         toc: bool,
+        /// Expose a read-only `_full.md` in every section directory: the
+        /// section's heading, its own content, and all its subsections
+        #[arg(long)]
+        full: bool,
+        /// How a heading's text becomes its directory name: `raw` keeps it
+        /// as-is (spaces and punctuation included); `kebab` lowercases it,
+        /// turns whitespace into `-`, and drops other punctuation
+        #[arg(long, value_enum, value_name = "STYLE", default_value_t = SlugStyle::Raw)]
+        slug: SlugStyle,
         /// Only mount .md files under a directory argument whose path
         /// (relative to that argument) matches this glob; repeatable
         #[arg(long = "include", value_name = "GLOB")]
@@ -78,10 +88,10 @@ mod app {
         #[arg(short = 'd', long)]
         background: bool,
         /// Stop a running mount (background or foreground) at this mountpoint and exit
-        #[arg(long, value_name = "MOUNTPOINT", conflicts_with_all = ["paths", "write", "allow_other", "watch", "toc", "include", "exclude", "filter", "backup", "on_conflict", "background", "list"])]
+        #[arg(long, value_name = "MOUNTPOINT", conflicts_with_all = ["paths", "write", "allow_other", "watch", "toc", "full", "slug", "include", "exclude", "filter", "backup", "on_conflict", "background", "list"])]
         stop: Option<PathBuf>,
         /// List currently running background mounts and exit
-        #[arg(long, conflicts_with_all = ["paths", "write", "allow_other", "watch", "toc", "include", "exclude", "filter", "backup", "on_conflict", "background", "stop"])]
+        #[arg(long, conflicts_with_all = ["paths", "write", "allow_other", "watch", "toc", "full", "slug", "include", "exclude", "filter", "backup", "on_conflict", "background", "stop"])]
         list: bool,
         /// Enable verbose (debug) logging
         #[arg(short, long)]
@@ -162,6 +172,8 @@ mod app {
                     backup: cli.backup,
                     filter: heading_filter,
                     on_conflict: cli.on_conflict,
+                    full: cli.full,
+                    slug: cli.slug,
                 },
             )
             .map_err(|e| miette::miette!("failed to read source file(s): {e}"))?,

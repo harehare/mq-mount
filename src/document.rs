@@ -11,6 +11,47 @@ use rustc_hash::FxHashMap;
 /// The canonical file name for a section's own body content.
 pub const CONTENT_FILE: &str = "content.md";
 
+/// How a heading's text becomes its directory name (`--slug`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum SlugStyle {
+    /// The heading text as-is: spaces and punctuation kept, only path
+    /// separators and control characters replaced (`Getting Started!`).
+    #[default]
+    Raw,
+    /// Lowercased, whitespace turned into `-`, and anything but letters,
+    /// digits, `-`, `_`, and `.` dropped (`getting-started`). Non-ASCII
+    /// letters are kept.
+    Kebab,
+}
+
+impl SlugStyle {
+    /// The directory name for a heading titled `title`. Always a fixed
+    /// point (`apply(apply(x)) == apply(x)`), which is what lets
+    /// `mkdir`/`rename` accept exactly the names this would produce.
+    pub fn apply(self, title: &str) -> String {
+        match self {
+            SlugStyle::Raw => slugify(title),
+            SlugStyle::Kebab => kebab_slug(title),
+        }
+    }
+}
+
+fn kebab_slug(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    for c in title.chars().flat_map(char::to_lowercase) {
+        if c.is_alphanumeric() || matches!(c, '_' | '.') {
+            out.push(c);
+        } else if (c.is_whitespace() || c == '-' || c == '/' || c == '\\') && !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let truncated: String = out.chars().take(200).collect();
+    match truncated.trim_end_matches('-') {
+        "" | "." | ".." => "untitled".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// A predicate tested against a single heading node to decide whether the
 /// section it opens should be exposed in the mount (`--filter`). Kept as a
 /// generic closure type, rather than referencing the query engine that
@@ -81,7 +122,7 @@ pub struct SectionTree {
 }
 
 impl SectionTree {
-    pub fn build(nodes: &[Node]) -> Self {
+    pub fn build_with(nodes: &[Node], slug: SlugStyle) -> Self {
         let mut idx = 0usize;
         let front_matter = match nodes.first() {
             Some(Node::Yaml(_)) => {
@@ -132,7 +173,7 @@ impl SectionTree {
                 stack.last_mut().unwrap().section.children.push(closed);
             }
 
-            let name = unique_name(&mut stack.last_mut().unwrap().seen_names, &nodes[idx].value());
+            let name = unique_name_with(&mut stack.last_mut().unwrap().seen_names, &nodes[idx].value(), slug);
             stack.push(Open {
                 section: Section {
                     name,
@@ -177,7 +218,11 @@ impl SectionTree {
 /// disambiguates against sibling names already seen under the same parent
 /// (duplicates get `-2`, `-3`, ...).
 pub(crate) fn unique_name(seen: &mut FxHashMap<String, u32>, title: &str) -> String {
-    let base = slugify(title);
+    unique_name_with(seen, title, SlugStyle::Raw)
+}
+
+fn unique_name_with(seen: &mut FxHashMap<String, u32>, title: &str, slug: SlugStyle) -> String {
+    let base = slug.apply(title);
     let count = seen.entry(base.clone()).or_insert(0);
     *count += 1;
     if *count == 1 { base } else { format!("{base}-{count}") }
@@ -226,6 +271,7 @@ pub struct Document {
     /// mq-markdown's normalized rendering of it. `None` if the parse didn't
     /// carry usable positions, in which case every render is a full one.
     baseline: Option<Baseline>,
+    slug: SlugStyle,
 }
 
 /// See [`Document::baseline`].
@@ -342,11 +388,21 @@ impl Document {
             .parse::<Markdown>()
             .map_err(|e| MutationError::Parse(e.to_string()))?;
         let baseline = Baseline::new(source, &markdown.nodes);
-        Ok(Self { markdown, baseline })
+        Ok(Self {
+            markdown,
+            baseline,
+            slug: SlugStyle::Raw,
+        })
+    }
+
+    /// Sets how [`Self::tree`] names each heading's directory.
+    pub fn with_slug(mut self, slug: SlugStyle) -> Self {
+        self.slug = slug;
+        self
     }
 
     pub fn tree(&self) -> SectionTree {
-        SectionTree::build(&self.markdown.nodes)
+        SectionTree::build_with(&self.markdown.nodes, self.slug)
     }
 
     /// Like [`Self::tree`], but prunes out any section that neither matches
@@ -430,6 +486,28 @@ impl Document {
 
     pub fn render_range(&self, range: Range<usize>) -> String {
         render_nodes(&self.markdown.nodes[range])
+    }
+
+    /// `section` in full: its heading, its own content, and every
+    /// subsection in `section.children` (recursively) — so only the
+    /// subsections a `--filter`ed tree still shows. For the root, that's
+    /// the preamble plus every section, without the front matter.
+    pub fn render_subtree(&self, section: &Section) -> String {
+        let mut out = String::new();
+        self.push_subtree(section, &mut out);
+        out
+    }
+
+    fn push_subtree(&self, section: &Section, out: &mut String) {
+        let start = section.heading_index.unwrap_or(section.own_content_range.start);
+        let text = self.render_range(start..section.own_content_range.end);
+        if !text.is_empty() {
+            push_block_separator(out);
+            out.push_str(&text);
+        }
+        for child in &section.children {
+            self.push_subtree(child, out);
+        }
     }
 
     pub fn frontmatter_value(&self, node_index: usize) -> &str {
@@ -1087,6 +1165,54 @@ mod tests {
         let (_, body) = QUIRKY.split_once("---\n\n").unwrap();
         assert!(out.starts_with("---\ntitle: y\n---\n"), "{out}");
         assert!(out.ends_with(body), "{out}");
+    }
+
+    #[test]
+    fn render_subtree_includes_the_heading_and_every_subsection() {
+        let doc = Document::parse("intro\n\n# A\n\na\n\n## B\n\nb\n\n### C\n\nc\n\n# D\n\nd\n").unwrap();
+        let tree = doc.tree();
+        assert_eq!(
+            doc.render_subtree(tree.find(&["A"]).unwrap()),
+            "# A\n\na\n\n## B\n\nb\n\n### C\n\nc\n"
+        );
+        assert_eq!(doc.render_subtree(tree.find(&["A", "B", "C"]).unwrap()), "### C\n\nc\n");
+        assert_eq!(
+            doc.render_subtree(&tree.root),
+            "intro\n\n# A\n\na\n\n## B\n\nb\n\n### C\n\nc\n\n# D\n\nd\n"
+        );
+    }
+
+    #[test]
+    fn render_subtree_of_a_filtered_tree_skips_hidden_subsections() {
+        let doc = Document::parse("# A\n\na\n\n## Keep\n\nk\n\n## Drop\n\nd\n").unwrap();
+        let filter = |n: &Node| n.value() != "Drop";
+        let tree = doc.tree_filtered(&filter);
+        assert_eq!(
+            doc.render_subtree(tree.find(&["A"]).unwrap()),
+            "# A\n\na\n\n## Keep\n\nk\n"
+        );
+    }
+
+    #[rstest]
+    #[case::raw(SlugStyle::Raw, "Getting Started!", "Getting Started!")]
+    #[case::kebab_basic(SlugStyle::Kebab, "Getting Started!", "getting-started")]
+    #[case::kebab_punctuation(SlugStyle::Kebab, "  API: v1.2 / `foo()` -- notes ", "api-v1.2-foo-notes")]
+    #[case::kebab_non_ascii(SlugStyle::Kebab, "日本語 の 見出し", "日本語-の-見出し")]
+    #[case::kebab_snake(SlugStyle::Kebab, "my_var", "my_var")]
+    #[case::kebab_empty(SlugStyle::Kebab, "!!!", "untitled")]
+    #[case::kebab_dot(SlugStyle::Kebab, ".", "untitled")]
+    fn slug_styles(#[case] style: SlugStyle, #[case] title: &str, #[case] expected: &str) {
+        assert_eq!(style.apply(title), expected);
+        assert_eq!(style.apply(expected), expected, "must be a fixed point");
+    }
+
+    #[test]
+    fn kebab_slugs_disambiguate_headings_that_collapse_to_the_same_name() {
+        let doc = Document::parse("# Foo Bar\n\n# foo-bar\n\n# FOO BAR!\n")
+            .unwrap()
+            .with_slug(SlugStyle::Kebab);
+        let names: Vec<String> = doc.tree().root.children.iter().map(|c| c.name.clone()).collect();
+        assert_eq!(names, vec!["foo-bar", "foo-bar-2", "foo-bar-3"]);
     }
 
     #[test]

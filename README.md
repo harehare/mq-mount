@@ -40,6 +40,8 @@ front matter
 ```
 
 - With `--toc`, every mounted file also gets a read-only `/a/_toc.md`: a linked Markdown list of its whole heading tree (e.g. `- [Sub A](<Title/Sub A/content.md>)`). Lets an agent see the structure in one read instead of walking every directory with `ls`. The mount root also gets a read-only `/_toc.md` aggregating every mounted file's heading tree in one place, under a `## <file>` heading each.
+- With `--full`, every section directory (and each file's root) also gets a read-only `_full.md`: the section's heading, its own body, and all its subsections, in one read. Under `--filter`, it includes only the subsections the filter leaves visible. A file root's `_full.md` is the whole document minus its front matter.
+- With `--slug kebab`, directory names are lowercased kebab-case (`## Getting Started!` -> `getting-started/`), which is easier to type in a shell than the default `--slug raw`. Letters outside ASCII (e.g. Japanese) are kept. `mkdir`/`rename` then only accept names already in that form (anything else fails with `EINVAL`), and the name becomes the heading text as-is.
 - A section's `content.md` holds only its own body — text up to the *next* heading of any depth, not its subsections'.
 - Nesting follows heading depth and document order, not indentation. Typing `#` inside a deeply-nested section's `content.md` creates a new top-level directory *within that file* on save, not a nested one.
 - The top-level, per-file/per-directory layout is fixed at mount time: `mkdir`/`rmdir`/`rename` there, or moving `content.md` between two mounted files, aren't supported (`EPERM`/`ENOENT`/`EOPNOTSUPP`).
@@ -58,7 +60,7 @@ front matter
 
 ## Use cases
 
-- **Token-efficient reading for LLM agents.** Don't load a whole doc into context — `grep -r` the mount to find a heading, then `cat` just that section's `content.md`. `ls` at each level doubles as a table of contents.
+- **Token-efficient reading for LLM agents.** Don't load a whole doc into context — `grep -r` the mount to find a heading, then `cat` just that section's `content.md` (or, with `--full`, its `_full.md` to get the whole chapter including subsections). `ls` at each level, or `--toc`'s `_toc.md`, doubles as a table of contents.
 - **Section-scoped edits.** Rewrite one section's `content.md` in isolation; `mq-mount` splices it back into the full document on save.
 - **Ad-hoc exploration.** `find`, `grep`, `fzf`, and any text editor work against the mount as-is — no Markdown-aware parser needed.
 
@@ -132,6 +134,13 @@ mq-mount docs/ /tmp/doc-mount --watch
 # Only mount files matching a glob (relative to the directory argument), skipping drafts:
 mq-mount docs/ /tmp/doc-mount --include "guide/**/*.md" --exclude "**/draft-*.md"
 
+# Add a read-only _full.md per section (the section plus all its subsections):
+mq-mount README.md /tmp/doc-mount --full
+cat /tmp/doc-mount/README/Usage/_full.md
+
+# Shell-friendly kebab-case directory names (`## Getting Started` -> getting-started/):
+mq-mount README.md /tmp/doc-mount --slug kebab
+
 # Add a read-only _toc.md per file listing its whole heading tree:
 mq-mount docs/ /tmp/doc-mount --toc
 cat /tmp/doc-mount/docs/guide/a/_toc.md
@@ -179,6 +188,14 @@ Options:
       --toc                Expose a read-only `_toc.md` at each mounted
                             file's root, listing its whole heading tree with
                             links to each section's content.md
+      --full               Expose a read-only `_full.md` in every section
+                            directory: the section's heading, its own
+                            content, and all its subsections
+      --slug <STYLE>       How a heading's text becomes its directory name:
+                            `raw` keeps it as-is (spaces and punctuation
+                            included); `kebab` lowercases it, turns
+                            whitespace into `-`, and drops other punctuation
+                            [default: raw] [possible values: raw, kebab]
       --include <GLOB>     Only mount .md files under a directory argument
                             whose path (relative to that argument) matches
                             this glob; repeatable

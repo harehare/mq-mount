@@ -20,6 +20,9 @@ pub enum MountPath {
     /// The synthetic, read-only `_toc.md` at a mounted file's root, present
     /// only when the mount was started with `--toc`.
     Toc,
+    /// The synthetic, read-only `_full.md` in every section directory (the
+    /// section with all its subsections), present only with `--full`.
+    Full(Vec<String>),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -27,6 +30,7 @@ struct ShadowNode {
     name: String,
     dir_ino: u64,
     content_ino: u64,
+    full_ino: u64,
     children: Vec<ShadowNode>,
 }
 
@@ -85,7 +89,7 @@ impl InodeTable {
     /// carrying forward inodes for sections that still exist. `next_ino` is a
     /// counter shared across every mounted file, so inode numbers stay
     /// globally unique across the whole mount.
-    pub fn sync(&mut self, next_ino: &mut u64, tree: &SectionTree, toc_enabled: bool) {
+    pub fn sync(&mut self, next_ino: &mut u64, tree: &SectionTree, toc_enabled: bool, full_enabled: bool) {
         self.path_to_ino.clear();
         self.ino_to_path.clear();
 
@@ -96,15 +100,22 @@ impl InodeTable {
         if old_root.dir_ino == 0 {
             old_root.dir_ino = alloc(next_ino);
         }
+        if old_root.full_ino == 0 {
+            old_root.full_ino = alloc(next_ino);
+        }
 
         self.record(MountPath::Dir(Vec::new()), old_root.dir_ino);
         self.record(MountPath::Content(Vec::new()), old_root.content_ino);
+        if full_enabled {
+            self.record(MountPath::Full(Vec::new()), old_root.full_ino);
+        }
 
-        let children = self.sync_children(next_ino, old_root.children, &tree.root.children, &[]);
+        let children = self.sync_children(next_ino, old_root.children, &tree.root.children, &[], full_enabled);
         self.shadow = ShadowNode {
             name: String::new(),
             dir_ino: old_root.dir_ino,
             content_ino: old_root.content_ino,
+            full_ino: old_root.full_ino,
             children,
         };
 
@@ -140,6 +151,7 @@ impl InodeTable {
         old_children: Vec<ShadowNode>,
         new_children: &[Section],
         parent_path: &[String],
+        full_enabled: bool,
     ) -> Vec<ShadowNode> {
         let mut old_by_name: FxHashMap<&str, usize> = FxHashMap::default();
         for (i, c) in old_children.iter().enumerate() {
@@ -170,22 +182,26 @@ impl InodeTable {
             let mut path = parent_path.to_vec();
             path.push(sec.name.clone());
 
-            let (dir_ino, content_ino, old_grandchildren) = match matches[ni] {
+            let (dir_ino, content_ino, full_ino, old_grandchildren) = match matches[ni] {
                 Some(oi) => {
                     let old = old_children[oi].take().unwrap();
-                    (old.dir_ino, old.content_ino, old.children)
+                    (old.dir_ino, old.content_ino, old.full_ino, old.children)
                 }
-                None => (alloc(next_ino), alloc(next_ino), Vec::new()),
+                None => (alloc(next_ino), alloc(next_ino), alloc(next_ino), Vec::new()),
             };
 
             self.record(MountPath::Dir(path.clone()), dir_ino);
             self.record(MountPath::Content(path.clone()), content_ino);
+            if full_enabled {
+                self.record(MountPath::Full(path.clone()), full_ino);
+            }
 
-            let children = self.sync_children(next_ino, old_grandchildren, &sec.children, &path);
+            let children = self.sync_children(next_ino, old_grandchildren, &sec.children, &path, full_enabled);
             result.push(ShadowNode {
                 name: sec.name.clone(),
                 dir_ino,
                 content_ino,
+                full_ino,
                 children,
             });
         }
@@ -202,7 +218,7 @@ mod tests {
     fn synced(table: &mut InodeTable, next_ino: &mut u64, src: &str) -> SectionTree {
         let doc = Document::parse(src).unwrap();
         let tree = doc.tree();
-        table.sync(next_ino, &tree, false);
+        table.sync(next_ino, &tree, false, false);
         tree
     }
 
