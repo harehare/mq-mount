@@ -1052,6 +1052,11 @@ impl MountFs for MqFs {
             let mut p = parent_path;
             p.push(name.to_string());
             MountPath::Dir(p)
+        } else if let Some(&ino) = state.scratch_by_name.get(&(parent, name.to_string())) {
+            // A temp file that was created but not yet renamed onto a
+            // canonical name. The Linux NFS client re-LOOKUPs it before the
+            // RENAME (we mount with `noac`), so it must stay resolvable.
+            return Ok(ino);
         } else {
             return Err(VfsError::NotFound);
         };
@@ -1702,6 +1707,22 @@ mod tests {
             persisted.contains("saved via temp file"),
             "persisted doc was: {persisted}"
         );
+    }
+
+    #[test]
+    fn scratch_files_are_resolvable_by_lookup_until_renamed() {
+        let (fs, _dir, file_ino) = mounted("# Title\n\noriginal\n");
+        let title_ino = fs.lookup(file_ino, "Title").unwrap();
+        assert!(matches!(fs.lookup(title_ino, ".tmp"), Err(VfsError::NotFound)));
+
+        let (created, _attr) = fs.create(title_ino, ".tmp").unwrap();
+        assert_eq!(fs.lookup(title_ino, ".tmp").unwrap(), created);
+
+        let exclusive = fs.create_exclusive(title_ino, "sedXXXXXX").unwrap();
+        assert_eq!(fs.lookup(title_ino, "sedXXXXXX").unwrap(), exclusive);
+
+        fs.rename(title_ino, ".tmp", title_ino, document::CONTENT_FILE).unwrap();
+        assert!(matches!(fs.lookup(title_ino, ".tmp"), Err(VfsError::NotFound)));
     }
 
     #[test]
