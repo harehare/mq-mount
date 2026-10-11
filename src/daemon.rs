@@ -31,10 +31,16 @@ pub struct PidFileGuard {
 }
 
 impl PidFileGuard {
-    pub fn create(mountpoint: &Path) -> std::io::Result<Self> {
+    /// Writes `<pid>\n<mountpoint>\n` followed by one mounted source path
+    /// per line; only the first two lines are required to read it back.
+    pub fn create(mountpoint: &Path, sources: &[PathBuf]) -> std::io::Result<Self> {
         fs::create_dir_all(state_dir())?;
         let path = state_file(mountpoint, "pid");
-        fs::write(&path, format!("{}\n{}\n", std::process::id(), mountpoint.display()))?;
+        let mut text = format!("{}\n{}\n", std::process::id(), mountpoint.display());
+        for source in sources {
+            text.push_str(&format!("{}\n", source.display()));
+        }
+        fs::write(&path, text)?;
         Ok(Self { path })
     }
 }
@@ -105,14 +111,28 @@ fn read_pid(path: &Path, mountpoint: &Path) -> miette::Result<i32> {
         .ok_or_else(|| miette::miette!("corrupt pid file: {}", path.display()))
 }
 
+/// A running mount, as recorded in its pid file.
+#[derive(Debug, PartialEq, Eq)]
+struct MountInfo {
+    pid: i32,
+    mountpoint: PathBuf,
+    /// Empty for a pid file written before sources were recorded.
+    sources: Vec<PathBuf>,
+}
+
 /// Like [`read_pid`], but for `--list`: a corrupt or unreadable pid file is
 /// skipped rather than aborting the whole listing.
-fn read_pid_and_mountpoint(path: &Path) -> Option<(i32, PathBuf)> {
+fn read_mount_info(path: &Path) -> Option<MountInfo> {
     let text = fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
     let pid = lines.next()?.parse().ok()?;
     let mountpoint = PathBuf::from(lines.next()?);
-    Some((pid, mountpoint))
+    let sources = lines.filter(|l| !l.is_empty()).map(PathBuf::from).collect();
+    Some(MountInfo {
+        pid,
+        mountpoint,
+        sources,
+    })
 }
 
 #[cfg(unix)]
@@ -139,7 +159,7 @@ fn is_alive(pid: i32) -> bool {
 /// scanning the state dir's `*.pid` files. Self-healing: a pid file whose
 /// process is no longer alive (e.g. it was `kill -9`'d, skipping
 /// `PidFileGuard`'s `Drop`) is removed instead of listed.
-pub fn list() -> miette::Result<()> {
+pub fn list(json: bool) -> miette::Result<()> {
     let mut mounts = Vec::new();
     if let Ok(entries) = fs::read_dir(state_dir()) {
         for entry in entries.flatten() {
@@ -147,28 +167,85 @@ pub fn list() -> miette::Result<()> {
             if path.extension().and_then(|e| e.to_str()) != Some("pid") {
                 continue;
             }
-            let Some((pid, mountpoint)) = read_pid_and_mountpoint(&path) else {
+            let Some(info) = read_mount_info(&path) else {
                 continue;
             };
-            if is_alive(pid) {
-                mounts.push((pid, mountpoint));
+            if is_alive(info.pid) {
+                mounts.push(info);
             } else {
                 let _ = fs::remove_file(&path);
                 let _ = fs::remove_file(path.with_extension("log"));
             }
         }
     }
+    mounts.sort_by(|a, b| a.mountpoint.cmp(&b.mountpoint));
 
+    if json {
+        println!("{}", mounts_json(&mounts));
+        return Ok(());
+    }
     if mounts.is_empty() {
         println!("no running mounts");
         return Ok(());
     }
-    mounts.sort_by(|a, b| a.1.cmp(&b.1));
-    println!("{:<10} MOUNTPOINT", "PID");
-    for (pid, mountpoint) in mounts {
-        println!("{pid:<10} {}", mountpoint.display());
+    println!("{:<10} {:<40} SOURCES", "PID", "MOUNTPOINT");
+    for info in mounts {
+        let sources: Vec<String> = info.sources.iter().map(|s| s.display().to_string()).collect();
+        println!(
+            "{:<10} {:<40} {}",
+            info.pid,
+            info.mountpoint.display(),
+            sources.join(" ")
+        );
     }
     Ok(())
+}
+
+/// `--list --json`: an array of `{pid, mountpoint, sources, log}` objects,
+/// `log` being the background log file (`null` for a foreground mount).
+fn mounts_json(mounts: &[MountInfo]) -> String {
+    let items: Vec<String> = mounts
+        .iter()
+        .map(|m| {
+            let sources: Vec<String> = m.sources.iter().map(|s| json_path(s)).collect();
+            let log = state_file(&m.mountpoint, "log");
+            let log = if log.exists() {
+                json_path(&log)
+            } else {
+                "null".to_string()
+            };
+            format!(
+                "{{\"pid\":{},\"mountpoint\":{},\"sources\":[{}],\"log\":{}}}",
+                m.pid,
+                json_path(&m.mountpoint),
+                sources.join(","),
+                log
+            )
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+fn json_path(path: &Path) -> String {
+    json_string(&path.to_string_lossy())
+}
+
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 #[cfg(unix)]
@@ -224,7 +301,7 @@ mod tests {
     fn pid_file_guard_writes_and_cleans_up() {
         let dir = tempfile::tempdir().unwrap();
         let mountpoint = dir.path().join("mnt");
-        let guard = PidFileGuard::create(&mountpoint).unwrap();
+        let guard = PidFileGuard::create(&mountpoint, &[PathBuf::from("/docs/a.md")]).unwrap();
 
         let path = state_file(&mountpoint, "pid");
         let contents = fs::read_to_string(&path).unwrap();
@@ -242,19 +319,50 @@ mod tests {
     }
 
     #[test]
-    fn read_pid_and_mountpoint_parses_the_pid_file_format() {
+    fn read_mount_info_parses_the_pid_file_format() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x.pid");
-        fs::write(&path, "12345\n/tmp/mnt\n").unwrap();
-        assert_eq!(read_pid_and_mountpoint(&path), Some((12345, PathBuf::from("/tmp/mnt"))));
+        fs::write(&path, "12345\n/tmp/mnt\n/docs/a.md\n/docs/b.md\n").unwrap();
+        assert_eq!(
+            read_mount_info(&path),
+            Some(MountInfo {
+                pid: 12345,
+                mountpoint: PathBuf::from("/tmp/mnt"),
+                sources: vec![PathBuf::from("/docs/a.md"), PathBuf::from("/docs/b.md")],
+            })
+        );
     }
 
     #[test]
-    fn read_pid_and_mountpoint_is_none_for_a_corrupt_file() {
+    fn read_mount_info_accepts_a_pid_file_without_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.pid");
+        fs::write(&path, "12345\n/tmp/mnt\n").unwrap();
+        let info = read_mount_info(&path).unwrap();
+        assert_eq!(info.pid, 12345);
+        assert!(info.sources.is_empty());
+    }
+
+    #[test]
+    fn read_mount_info_is_none_for_a_corrupt_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x.pid");
         fs::write(&path, "not-a-pid\n").unwrap();
-        assert_eq!(read_pid_and_mountpoint(&path), None);
+        assert_eq!(read_mount_info(&path), None);
+    }
+
+    #[test]
+    fn mounts_json_escapes_paths_and_lists_sources() {
+        let json = mounts_json(&[MountInfo {
+            pid: 7,
+            mountpoint: PathBuf::from("/tmp/never-mounted \"q\"\\x"),
+            sources: vec![PathBuf::from("/a.md")],
+        }]);
+        assert_eq!(
+            json,
+            r#"[{"pid":7,"mountpoint":"/tmp/never-mounted \"q\"\\x","sources":["/a.md"],"log":null}]"#
+        );
+        assert_eq!(mounts_json(&[]), "[]");
     }
 
     #[test]

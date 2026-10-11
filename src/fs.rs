@@ -20,13 +20,40 @@ use std::time::SystemTime;
 
 use rustc_hash::FxHashMap;
 
-use crate::document::{self, Document, FrontMatterKind, MutationError, Section};
+use crate::document::{self, Document, FrontMatterKind, MutationError, Section, SlugStyle};
 use crate::inode::{InodeTable, MountPath, ROOT_INO};
 use crate::vfs::{DirEntryOwned, FileAttr, FileKind, Ino, MountFs, VfsError};
 
 /// The synthetic, read-only heading-tree listing exposed at a mounted file's
 /// root when the mount was started with `--toc`.
 const TOC_FILE: &str = "_toc.md";
+
+/// The synthetic, read-only full-text file in every section directory when
+/// the mount was started with `--full`: the section's heading, its own
+/// content, and all of its subsections in one read.
+const FULL_FILE: &str = "_full.md";
+
+/// The per-file view settings every [`FileMount`] is (re)built with.
+#[derive(Clone)]
+struct ViewOptions {
+    toc: bool,
+    full: bool,
+    slug: SlugStyle,
+    filter: Option<Arc<document::HeadingFilter>>,
+}
+
+impl ViewOptions {
+    fn parse(&self, text: &str) -> Result<Document, MutationError> {
+        Document::parse(text).map(|d| d.with_slug(self.slug))
+    }
+
+    fn tree(&self, document: &Document) -> document::SectionTree {
+        match self.filter.as_deref() {
+            Some(f) => document.tree_filtered(f),
+            None => document.tree(),
+        }
+    }
+}
 
 struct FileMount {
     document: Document,
@@ -60,19 +87,15 @@ impl FileMount {
     fn open(
         source_path: PathBuf,
         next_ino: &mut Ino,
-        toc_enabled: bool,
         mount_path: Vec<String>,
-        filter: Option<&document::HeadingFilter>,
+        view: &ViewOptions,
     ) -> std::io::Result<Self> {
         let text = fs::read_to_string(&source_path)?;
         let mtime = fs::metadata(&source_path).ok().and_then(|m| m.modified().ok());
-        let document = Document::parse(&text).map_err(|e| std::io::Error::other(e.to_string()))?;
-        let tree = match filter {
-            Some(f) => document.tree_filtered(f),
-            None => document.tree(),
-        };
+        let document = view.parse(&text).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let tree = view.tree(&document);
         let mut inodes = InodeTable::new();
-        inodes.sync(next_ino, &tree, toc_enabled);
+        inodes.sync(next_ino, &tree, view.toc, view.full);
         let backed_up = backup_path(&source_path).exists();
         Ok(Self {
             document,
@@ -96,6 +119,41 @@ fn backup_path(source_path: &std::path::Path) -> PathBuf {
     let mut name = source_path.as_os_str().to_owned();
     name.push(".orig");
     PathBuf::from(name)
+}
+
+/// Where [`ConflictPolicy::KeepBoth`] sets aside a local version that
+/// couldn't be written: `<file>.conflict-<unix seconds>` next to the source
+/// (with `-2`, `-3`, ... appended if that's taken). Deliberately not ending
+/// in `.md`, so a directory mount (or `--watch`) never picks it up as a
+/// new document.
+fn conflict_path(source_path: &std::path::Path) -> PathBuf {
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let mut base = source_path.as_os_str().to_owned();
+    base.push(format!(".conflict-{secs}"));
+    let mut candidate = PathBuf::from(&base);
+    let mut n = 2;
+    while candidate.exists() {
+        let mut name = base.clone();
+        name.push(format!("-{n}"));
+        candidate = PathBuf::from(name);
+        n += 1;
+    }
+    candidate
+}
+
+/// What to do when a local edit can't be flushed because the source file
+/// changed on disk since the mount last read it (`--on-conflict`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum ConflictPolicy {
+    /// Save the mount's version to a sibling `<file>.conflict-<time>` file,
+    /// then load the version on disk so the mount keeps working.
+    #[default]
+    KeepBoth,
+    /// Keep the mount's version in memory and fail every flush until the
+    /// mount is restarted.
+    Reject,
 }
 
 struct SuperDir {
@@ -144,22 +202,37 @@ struct MountState {
     /// is exposed only if it (or a descendant) matches. `None` mounts every
     /// section, as before. Forces the mount read-only at the CLI layer.
     filter: Option<Arc<document::HeadingFilter>>,
+    on_conflict: ConflictPolicy,
+    /// Whether every section directory exposes a synthetic, read-only
+    /// [`FULL_FILE`] (`--full`).
+    full: bool,
+    /// How heading text becomes a directory name (`--slug`).
+    slug: SlugStyle,
 }
 
 impl MountState {
-    fn open(
-        entries: Vec<(PathBuf, Vec<String>)>,
-        readonly: bool,
-        allow_other: bool,
-        toc: bool,
-        backup: bool,
-        filter: Option<Arc<document::HeadingFilter>>,
-    ) -> std::io::Result<Self> {
+    fn open(entries: Vec<(PathBuf, Vec<String>)>, options: MountOptions) -> std::io::Result<Self> {
+        let MountOptions {
+            readonly,
+            allow_other,
+            toc,
+            backup,
+            filter,
+            on_conflict,
+            full,
+            slug,
+        } = options;
         let mut next_ino = ROOT_INO + 1;
         let mut files = Vec::with_capacity(entries.len());
         let mut mounted_paths = FxHashMap::default();
+        let view = ViewOptions {
+            toc,
+            full,
+            slug,
+            filter: filter.clone(),
+        };
         for (idx, (source_path, mount_path)) in entries.into_iter().enumerate() {
-            let file = FileMount::open(source_path.clone(), &mut next_ino, toc, mount_path, filter.as_deref())?;
+            let file = FileMount::open(source_path.clone(), &mut next_ino, mount_path, &view)?;
             mounted_paths.insert(source_path, idx);
             files.push(file);
         }
@@ -189,6 +262,9 @@ impl MountState {
             root_toc_ino: None,
             backup,
             filter,
+            on_conflict,
+            full,
+            slug,
         };
         #[cfg(unix)]
         {
@@ -230,13 +306,8 @@ impl MountState {
             return Ok(());
         }
 
-        let file = FileMount::open(
-            source_path.clone(),
-            &mut self.next_ino,
-            self.toc,
-            mount_path.clone(),
-            self.filter.as_deref(),
-        )?;
+        let view = self.view();
+        let file = FileMount::open(source_path.clone(), &mut self.next_ino, mount_path.clone(), &view)?;
         let file_idx = self.files.len();
         let entry_inos: Vec<Ino> = file.inodes.entries().map(|(ino, _)| ino).collect();
         let root_ino = file.inodes.root_dir_ino();
@@ -382,24 +453,29 @@ impl MountState {
         (children, seen_names)
     }
 
+    fn view(&self) -> ViewOptions {
+        ViewOptions {
+            toc: self.toc,
+            full: self.full,
+            slug: self.slug,
+            filter: self.filter.clone(),
+        }
+    }
+
     fn rebuild(&mut self, file_idx: usize) {
+        let view = self.view();
         let MountState {
             files,
             next_ino,
             ino_owner,
             content_cache,
-            toc,
             root_toc_ino,
-            filter,
             ..
         } = self;
         let file = &mut files[file_idx];
         let old_inos: Vec<Ino> = file.inodes.entries().map(|(ino, _)| ino).collect();
-        file.tree = match filter.as_deref() {
-            Some(f) => file.document.tree_filtered(f),
-            None => file.document.tree(),
-        };
-        file.inodes.sync(next_ino, &file.tree, *toc);
+        file.tree = view.tree(&file.document);
+        file.inodes.sync(next_ino, &file.tree, view.toc, view.full);
         for ino in old_inos {
             ino_owner.remove(&ino);
             // Ranges shift on any edit, so a survived ino's cached bytes are
@@ -416,7 +492,10 @@ impl MountState {
         }
     }
 
-    /// Refuses (`VfsError::Conflict`) rather than silently overwriting a source file changed on disk since it was last read.
+    /// Never silently overwrites a source file changed on disk since it was
+    /// last read: fails with `VfsError::Conflict` instead, after (with
+    /// [`ConflictPolicy::KeepBoth`]) setting the local version aside and
+    /// reloading the external one — see [`Self::resolve_conflict`].
     fn persist(&mut self, file_idx: usize) -> Result<(), VfsError> {
         let file = &mut self.files[file_idx];
         let rendered = file.document.render();
@@ -428,11 +507,7 @@ impl MountState {
         if let (Some(known), Some(current)) = (file.last_known_mtime, current_mtime)
             && current > known
         {
-            tracing::warn!(
-                "{} changed on disk outside the mount since it was last read; refusing to overwrite it",
-                file.source_path.display()
-            );
-            return Err(VfsError::Conflict);
+            return Err(self.resolve_conflict(file_idx, &rendered));
         }
         if self.backup && !file.backed_up {
             let orig = backup_path(&file.source_path);
@@ -448,6 +523,53 @@ impl MountState {
         file.last_known_mtime = fs::metadata(&file.source_path).ok().and_then(|m| m.modified().ok());
         file.dirty = false;
         Ok(())
+    }
+
+    /// Handles a local edit that can't be written because the source changed
+    /// on disk in the meantime. With [`ConflictPolicy::KeepBoth`], the local
+    /// version (`rendered`) is saved to a sibling conflict file (see
+    /// [`conflict_path`]) and the external version is loaded in its place,
+    /// so the mount is immediately usable again instead of failing every
+    /// later write until a remount. Either way the error is returned, so the
+    /// operation that hit the conflict still fails visibly.
+    fn resolve_conflict(&mut self, file_idx: usize, rendered: &str) -> VfsError {
+        let source_path = self.files[file_idx].source_path.clone();
+        if self.on_conflict == ConflictPolicy::Reject {
+            tracing::warn!(
+                "{} changed on disk outside the mount since it was last read; refusing to overwrite it",
+                source_path.display()
+            );
+            return VfsError::Conflict;
+        }
+
+        let aside = conflict_path(&source_path);
+        if let Err(e) = fs::write(&aside, rendered) {
+            tracing::warn!(
+                "{} changed on disk outside the mount, and saving the mount's version to {} failed ({e}); \
+                 keeping it in memory, refusing to overwrite the source",
+                source_path.display(),
+                aside.display()
+            );
+            return VfsError::Conflict;
+        }
+        let file = &mut self.files[file_idx];
+        file.dirty = false;
+        // Forget the last-known mtime so the reload below can't skip it...
+        let known_mtime = file.last_known_mtime.take();
+        self.refresh_if_changed(file_idx);
+        // ...but restore it if the reload failed (e.g. the external version
+        // doesn't parse), or the next flush would overwrite that version.
+        let file = &mut self.files[file_idx];
+        if file.last_known_mtime.is_none() {
+            file.last_known_mtime = known_mtime;
+        }
+        tracing::warn!(
+            "{} changed on disk outside the mount while it had unsaved edits; \
+             saved the mount's version to {} and loaded the version on disk",
+            source_path.display(),
+            aside.display()
+        );
+        VfsError::Conflict
     }
 
     fn rebuild_and_persist(&mut self, file_idx: usize) -> Result<(), VfsError> {
@@ -484,7 +606,7 @@ impl MountState {
         let Ok(text) = fs::read_to_string(&file.source_path) else {
             return;
         };
-        let document = match Document::parse(&text) {
+        let document = match self.view().parse(&text) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!(
@@ -600,6 +722,8 @@ impl MountState {
     fn canonical_child(&self, parent_path: &[String], name: &str) -> Option<MountPath> {
         if name == document::CONTENT_FILE {
             Some(MountPath::Content(parent_path.to_vec()))
+        } else if self.full && name == FULL_FILE {
+            Some(MountPath::Full(parent_path.to_vec()))
         } else if parent_path.is_empty() && self.toc && name == TOC_FILE {
             Some(MountPath::Toc)
         } else if parent_path.is_empty() {
@@ -619,6 +743,12 @@ impl MountState {
         self.scratch.insert(ino, Vec::new());
         self.scratch_by_name.insert(key, ino);
         ino
+    }
+
+    fn full_bytes(&self, file_idx: usize, path: &[String]) -> Vec<u8> {
+        self.find_section(file_idx, path)
+            .map(|section| self.files[file_idx].document.render_subtree(&section).into_bytes())
+            .unwrap_or_default()
     }
 
     fn toc_bytes(&self, file_idx: usize) -> Vec<u8> {
@@ -667,6 +797,7 @@ impl MountState {
             MountPath::Content(p) => self.section_bytes(file_idx, p),
             MountPath::FrontMatter(kind) => self.frontmatter_bytes(file_idx, *kind),
             MountPath::Toc => self.toc_bytes(file_idx),
+            MountPath::Full(p) => self.full_bytes(file_idx, p),
             MountPath::Dir(_) => Vec::new(),
         };
         self.content_cache.insert(ino, bytes.clone());
@@ -685,7 +816,7 @@ impl MountState {
             MountPath::Content(p) => self.commit_content(file_idx, p, text, defer),
             MountPath::FrontMatter(kind) => self.commit_frontmatter(file_idx, *kind, text, defer),
             MountPath::Dir(_) => Err(VfsError::IsDir),
-            MountPath::Toc => Err(VfsError::ReadOnly),
+            MountPath::Toc | MountPath::Full(_) => Err(VfsError::ReadOnly),
         }
     }
 
@@ -719,13 +850,40 @@ fn write_toc_entries(sections: &[Section], link_prefix: &[String], indent: usize
         path.push(s.name.clone());
         out.push_str(&"  ".repeat(indent));
         out.push_str(&format!(
-            "- [{}]({}/{})\n",
-            s.name,
-            path.join("/"),
+            "- [{}](<{}/{}>)\n",
+            escape_link_text(&s.name),
+            escape_link_destination(&path.join("/")),
             document::CONTENT_FILE
         ));
         write_toc_entries(&s.children, &path, indent + 1, out);
     }
+}
+
+/// Backslash-escapes characters that would otherwise end or restructure a
+/// link's `[text]` (or start emphasis/code inside it).
+fn escape_link_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '\\' | '[' | ']' | '*' | '_' | '`' | '<' | '>') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Escapes a path for use inside an angle-bracketed link destination
+/// (`[text](<dest>)`), the only CommonMark form that allows raw spaces and
+/// unbalanced parentheses — both common in heading-derived directory names.
+fn escape_link_destination(dest: &str) -> String {
+    let mut out = String::with_capacity(dest.len());
+    for c in dest.chars() {
+        if matches!(c, '\\' | '<' | '>') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn map_mutation_error(e: MutationError) -> VfsError {
@@ -776,21 +934,28 @@ fn paginate(entries: Vec<DirEntryOwned>, start_after: Ino, max_entries: usize) -
     (page, end)
 }
 
+/// Mount-wide settings chosen on the command line; see the matching CLI
+/// flags in `main.rs` for what each one does.
+#[derive(Clone, Default)]
+pub struct MountOptions {
+    pub readonly: bool,
+    pub allow_other: bool,
+    pub toc: bool,
+    pub backup: bool,
+    pub filter: Option<Arc<document::HeadingFilter>>,
+    pub on_conflict: ConflictPolicy,
+    pub full: bool,
+    pub slug: SlugStyle,
+}
+
 pub struct MqFs {
     state: Mutex<MountState>,
 }
 
 impl MqFs {
-    pub fn new(
-        entries: Vec<(PathBuf, Vec<String>)>,
-        readonly: bool,
-        allow_other: bool,
-        toc: bool,
-        backup: bool,
-        filter: Option<Arc<document::HeadingFilter>>,
-    ) -> std::io::Result<Self> {
+    pub fn new(entries: Vec<(PathBuf, Vec<String>)>, options: MountOptions) -> std::io::Result<Self> {
         Ok(Self {
-            state: Mutex::new(MountState::open(entries, readonly, allow_other, toc, backup, filter)?),
+            state: Mutex::new(MountState::open(entries, options)?),
         })
     }
 
@@ -887,6 +1052,11 @@ impl MountFs for MqFs {
             let mut p = parent_path;
             p.push(name.to_string());
             MountPath::Dir(p)
+        } else if let Some(&ino) = state.scratch_by_name.get(&(parent, name.to_string())) {
+            // A temp file that was created but not yet renamed onto a
+            // canonical name. The Linux NFS client re-LOOKUPs it before the
+            // RENAME (we mount with `noac`), so it must stay resolvable.
+            return Ok(ino);
         } else {
             return Err(VfsError::NotFound);
         };
@@ -1018,7 +1188,7 @@ impl MountFs for MqFs {
         let (file_idx, parent_path) = state.dir_path(parent).ok_or(VfsError::NotFound)?;
 
         if let Some(mp) = state.canonical_child(&parent_path, name) {
-            if matches!(mp, MountPath::Toc) {
+            if matches!(mp, MountPath::Toc | MountPath::Full(_)) {
                 return Err(VfsError::ReadOnly);
             }
             let ino = state.files[file_idx].inodes.ino_for(&mp).ok_or(VfsError::Io)?;
@@ -1063,7 +1233,7 @@ impl MountFs for MqFs {
         if state.super_dirs.contains_key(&parent) {
             return Err(VfsError::PermissionDenied);
         }
-        if document::slugify(name) != name {
+        if state.slug.apply(name) != name {
             return Err(VfsError::Invalid);
         }
         let (file_idx, parent_path) = state.dir_path(parent).ok_or(VfsError::NotFound)?;
@@ -1101,7 +1271,7 @@ impl MountFs for MqFs {
         if name == document::CONTENT_FILE {
             return state.commit_content(file_idx, &parent_path, "", false);
         }
-        if parent_path.is_empty() && state.toc && name == TOC_FILE {
+        if (parent_path.is_empty() && state.toc && name == TOC_FILE) || (state.full && name == FULL_FILE) {
             return Err(VfsError::ReadOnly);
         }
         if parent_path.is_empty()
@@ -1130,7 +1300,7 @@ impl MountFs for MqFs {
         let dest_kind = match state.canonical_child(&new_parent_path, to_name) {
             Some(MountPath::Content(_)) => Some(RenameDest::Content),
             Some(MountPath::FrontMatter(kind)) => Some(RenameDest::FrontMatter(kind)),
-            Some(MountPath::Toc) => return Err(VfsError::ReadOnly),
+            Some(MountPath::Toc | MountPath::Full(_)) => return Err(VfsError::ReadOnly),
             _ => None,
         };
 
@@ -1175,7 +1345,7 @@ impl MountFs for MqFs {
             return Ok(());
         }
 
-        if document::slugify(to_name) != to_name {
+        if state.slug.apply(to_name) != to_name {
             return Err(VfsError::Invalid);
         }
 
@@ -1252,6 +1422,19 @@ impl MountFs for MqFs {
             attr: state.attr_at(content_ino, FileKind::File, content_size, now),
         });
 
+        if state.full
+            && let Some(full_ino) = state.files[file_idx].inodes.ino_for(&MountPath::Full(path.clone()))
+        {
+            let size = state
+                .content_bytes_cached(file_idx, full_ino, &MountPath::Full(path.clone()))
+                .len() as u64;
+            entries.push(DirEntryOwned {
+                ino: full_ino,
+                name: FULL_FILE.to_string(),
+                attr: state.attr_at(full_ino, FileKind::File, size, now),
+            });
+        }
+
         if path.is_empty()
             && let Some((kind, _)) = state.files[file_idx].tree.front_matter
             && let Some(fm_ino) = state.files[file_idx].inodes.ino_for(&MountPath::FrontMatter(kind))
@@ -1319,11 +1502,12 @@ mod tests {
         std::fs::write(&path, content).unwrap();
         let fs = MqFs::new(
             vec![(path.clone(), vec!["doc".to_string()])],
-            readonly,
-            allow_other,
-            toc,
-            false,
-            None,
+            MountOptions {
+                readonly,
+                allow_other,
+                toc,
+                ..Default::default()
+            },
         )
         .unwrap();
         let (entries, _) = fs.readdir(fs.root_ino(), 0, 100).unwrap();
@@ -1357,6 +1541,34 @@ mod tests {
         fs.flush();
         let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
         assert!(persisted.contains("new body"), "persisted doc was: {persisted}");
+    }
+
+    #[test]
+    fn saving_one_section_leaves_the_rest_of_the_source_byte_identical() {
+        let src = "# Title\n\n* a\n* b\n\n|x|y|\n|-|-|\n|1|2|\n\n## Edit me\nold\n\n## Keep\n\n+ k\n";
+        let (fs, dir, file_ino) = mounted(src);
+        let content_ino = lookup_path(&fs, file_ino, &["Title", "Edit me", document::CONTENT_FILE]);
+
+        fs.truncate(content_ino).unwrap();
+        fs.write(content_ino, 0, b"new\n").unwrap();
+        fs.flush();
+
+        let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
+        assert_eq!(persisted, src.replace("## Edit me\nold\n", "## Edit me\n\nnew\n"));
+    }
+
+    #[test]
+    fn resaving_unchanged_content_does_not_touch_the_source() {
+        let src = "# Title\n\n* a\n* b\n\n|x|y|\n|-|-|\n|1|2|\n";
+        let (fs, dir, file_ino) = mounted(src);
+        let content_ino = lookup_path(&fs, file_ino, &["Title", document::CONTENT_FILE]);
+        let (body, _) = fs.read(content_ino, 0, 4096).unwrap();
+
+        fs.truncate(content_ino).unwrap();
+        fs.write(content_ino, 0, &body).unwrap();
+        fs.flush();
+
+        assert_eq!(std::fs::read_to_string(dir.path().join("doc.md")).unwrap(), src);
     }
 
     #[test]
@@ -1465,11 +1677,7 @@ mod tests {
         std::fs::write(&b, "# B\n\nbody\n").unwrap();
         let fs = MqFs::new(
             vec![(a, vec!["a".into()]), (b, vec!["b".into()])],
-            false,
-            false,
-            false,
-            false,
-            None,
+            MountOptions::default(),
         )
         .unwrap();
 
@@ -1502,6 +1710,22 @@ mod tests {
     }
 
     #[test]
+    fn scratch_files_are_resolvable_by_lookup_until_renamed() {
+        let (fs, _dir, file_ino) = mounted("# Title\n\noriginal\n");
+        let title_ino = fs.lookup(file_ino, "Title").unwrap();
+        assert!(matches!(fs.lookup(title_ino, ".tmp"), Err(VfsError::NotFound)));
+
+        let (created, _attr) = fs.create(title_ino, ".tmp").unwrap();
+        assert_eq!(fs.lookup(title_ino, ".tmp").unwrap(), created);
+
+        let exclusive = fs.create_exclusive(title_ino, "sedXXXXXX").unwrap();
+        assert_eq!(fs.lookup(title_ino, "sedXXXXXX").unwrap(), exclusive);
+
+        fs.rename(title_ino, ".tmp", title_ino, document::CONTENT_FILE).unwrap();
+        assert!(matches!(fs.lookup(title_ino, ".tmp"), Err(VfsError::NotFound)));
+    }
+
+    #[test]
     fn readonly_mount_rejects_every_mutation() {
         let (fs, _dir, file_ino) = mounted_with("# Title\n\nbody\n", true, false);
         let title_ino = fs.lookup(file_ino, "Title").unwrap();
@@ -1531,9 +1755,94 @@ mod tests {
         assert!(!persisted.contains("body"), "persisted doc was: {persisted}");
     }
 
+    fn mounted_rejecting_conflicts(content: &str) -> (MqFs, tempfile::TempDir, Ino) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, content).unwrap();
+        let fs = MqFs::new(
+            vec![(path, vec!["doc".to_string()])],
+            MountOptions {
+                on_conflict: ConflictPolicy::Reject,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let file_ino = fs.lookup(ROOT_INO, "doc").unwrap();
+        (fs, dir, file_ino)
+    }
+
+    /// Simulates an external edit, mtime pushed well past mount time.
+    fn edit_externally(path: &std::path::Path, content: &str) {
+        std::fs::write(path, content).unwrap();
+        let future = SystemTime::now() + std::time::Duration::from_secs(3600);
+        std::fs::File::open(path).unwrap().set_modified(future).unwrap();
+    }
+
+    fn conflict_files(dir: &std::path::Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().contains(".conflict-"))
+            .collect()
+    }
+
+    #[test]
+    fn a_conflicting_flush_sets_the_local_version_aside_and_loads_the_external_one() {
+        let (fs, dir, file_ino) = mounted("# Title\n\noriginal\n");
+        let path = dir.path().join("doc.md");
+        let content_ino = lookup_path(&fs, file_ino, &["Title", document::CONTENT_FILE]);
+
+        fs.truncate(content_ino).unwrap();
+        fs.write(content_ino, 0, b"local edit\n").unwrap();
+        edit_externally(&path, "# Title\n\nexternal edit\n\n## Added\n");
+        fs.flush();
+
+        // The external version wins on disk and in the mount...
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# Title\n\nexternal edit\n\n## Added\n"
+        );
+        let content_ino = lookup_path(&fs, file_ino, &["Title", document::CONTENT_FILE]);
+        let (bytes, _) = fs.read(content_ino, 0, 1024).unwrap();
+        assert_eq!(bytes, b"external edit\n");
+        assert!(fs.lookup(lookup_path(&fs, file_ino, &["Title"]), "Added").is_ok());
+
+        // ...and the local edit is kept beside it, outside the `.md` namespace.
+        let aside = conflict_files(dir.path());
+        assert_eq!(aside.len(), 1);
+        assert!(aside[0].extension().is_none_or(|e| e != "md"));
+        assert!(std::fs::read_to_string(&aside[0]).unwrap().contains("local edit"));
+
+        // The mount keeps working: the next edit lands normally.
+        fs.truncate(content_ino).unwrap();
+        fs.write(content_ino, 0, b"after\n").unwrap();
+        fs.flush();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("after"));
+        assert_eq!(conflict_files(dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn a_synchronous_edit_hitting_a_conflict_still_fails_but_leaves_the_mount_usable() {
+        let (fs, dir, file_ino) = mounted("# Title\n\noriginal\n");
+        let path = dir.path().join("doc.md");
+        edit_externally(&path, "# Title\n\nexternal edit\n");
+
+        let title_ino = lookup_path(&fs, file_ino, &["Title"]);
+        assert!(matches!(fs.mkdir(title_ino, "New"), Err(VfsError::Conflict)));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# Title\n\nexternal edit\n");
+        assert!(
+            std::fs::read_to_string(&conflict_files(dir.path())[0])
+                .unwrap()
+                .contains("## New")
+        );
+
+        fs.mkdir(title_ino, "New").unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("## New"));
+    }
+
     #[test]
     fn write_refuses_to_overwrite_a_file_changed_externally_since_mount() {
-        let (fs, dir, file_ino) = mounted("# Title\n\noriginal\n");
+        let (fs, dir, file_ino) = mounted_rejecting_conflicts("# Title\n\noriginal\n");
         let content_ino = lookup_path(&fs, file_ino, &["Title", document::CONTENT_FILE]);
         let path = dir.path().join("doc.md");
 
@@ -1608,11 +1917,7 @@ mod tests {
                 (a, vec!["docs".into(), "guide".into(), "a".into()]),
                 (b, vec!["docs".into(), "api".into(), "b".into()]),
             ],
-            false,
-            false,
-            false,
-            false,
-            None,
+            MountOptions::default(),
         )
         .unwrap();
 
@@ -1650,11 +1955,7 @@ mod tests {
 
         let fs = MqFs::new(
             vec![(a, vec!["doc".into()]), (b, vec!["doc".into()])],
-            false,
-            false,
-            false,
-            false,
-            None,
+            MountOptions::default(),
         )
         .unwrap();
 
@@ -1714,15 +2015,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("docs")).unwrap();
         let a = dir.path().join("docs/a.md");
         std::fs::write(&a, "# A\n").unwrap();
-        let fs = MqFs::new(
-            vec![(a, vec!["docs".into(), "a".into()])],
-            false,
-            false,
-            false,
-            false,
-            None,
-        )
-        .unwrap();
+        let fs = MqFs::new(vec![(a, vec!["docs".into(), "a".into()])], MountOptions::default()).unwrap();
         let docs_ino_before = fs.lookup(ROOT_INO, "docs").unwrap();
 
         let b = dir.path().join("docs/b.md");
@@ -1775,8 +2068,133 @@ mod tests {
         let toc_ino = fs.lookup(file_ino, TOC_FILE).unwrap();
         let (bytes, _) = fs.read(toc_ino, 0, 4096).unwrap();
         let toc = String::from_utf8(bytes).unwrap();
-        assert!(toc.contains("[Title](Title/content.md)"));
-        assert!(toc.contains("[Sub A](Title/Sub A/content.md)"));
+        assert!(toc.contains("[Title](<Title/content.md>)"));
+        assert!(toc.contains("[Sub A](<Title/Sub A/content.md>)"));
+    }
+
+    #[test]
+    fn toc_links_parse_back_as_links_even_with_awkward_heading_names() {
+        let (fs, _dir, file_ino) = mounted_with_toc("# Setup (macOS)\n\n## a <b> [c]\n\nbody\n", false, false, true);
+        let toc_ino = fs.lookup(file_ino, TOC_FILE).unwrap();
+        let (bytes, _) = fs.read(toc_ino, 0, 4096).unwrap();
+        let toc = String::from_utf8(bytes).unwrap();
+        assert!(toc.contains("[Setup (macOS)](<Setup (macOS)/content.md>)"));
+        assert!(toc.contains(r"[a \<b\> \[c\]](<Setup (macOS)/a \<b\> [c]/content.md>)"));
+
+        let md: mq_markdown::Markdown = toc.parse().unwrap();
+        let urls: Vec<String> = md.nodes.iter().flat_map(collect_link_urls).collect();
+        assert_eq!(
+            urls,
+            vec!["Setup (macOS)/content.md", "Setup (macOS)/a <b> [c]/content.md"]
+        );
+    }
+
+    fn collect_link_urls(node: &mq_markdown::Node) -> Vec<String> {
+        match node {
+            mq_markdown::Node::Link(l) => vec![l.url.as_str().to_string()],
+            other => other.children().iter().flat_map(collect_link_urls).collect(),
+        }
+    }
+
+    fn mounted_with_options(content: &str, options: MountOptions) -> (MqFs, tempfile::TempDir, Ino) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, content).unwrap();
+        let fs = MqFs::new(vec![(path, vec!["doc".to_string()])], options).unwrap();
+        let file_ino = fs.lookup(ROOT_INO, "doc").unwrap();
+        (fs, dir, file_ino)
+    }
+
+    fn read_all(fs: &MqFs, ino: Ino) -> String {
+        String::from_utf8(fs.read(ino, 0, 1 << 20).unwrap().0).unwrap()
+    }
+
+    #[test]
+    fn full_file_holds_the_section_with_all_its_subsections() {
+        let (fs, _dir, file_ino) = mounted_with_options(
+            "# A\n\na\n\n## B\n\nb\n\n# C\n\nc\n",
+            MountOptions {
+                full: true,
+                ..Default::default()
+            },
+        );
+        let a_ino = lookup_path(&fs, file_ino, &["A"]);
+        let full_ino = fs.lookup(a_ino, FULL_FILE).unwrap();
+        assert_eq!(read_all(&fs, full_ino), "# A\n\na\n\n## B\n\nb\n");
+
+        let root_full = fs.lookup(file_ino, FULL_FILE).unwrap();
+        assert_eq!(read_all(&fs, root_full), "# A\n\na\n\n## B\n\nb\n\n# C\n\nc\n");
+
+        let (entries, _) = fs.readdir(a_ino, 0, 100).unwrap();
+        let entry = entries.iter().find(|e| e.name == FULL_FILE).unwrap();
+        assert_eq!(entry.attr.size, "# A\n\na\n\n## B\n\nb\n".len() as u64);
+
+        // Read-only, however it's approached.
+        assert!(matches!(fs.write(full_ino, 0, b"x"), Err(VfsError::ReadOnly)));
+        assert!(matches!(fs.truncate(full_ino), Err(VfsError::ReadOnly)));
+        assert!(matches!(fs.remove(a_ino, FULL_FILE), Err(VfsError::ReadOnly)));
+        assert!(matches!(fs.create(a_ino, FULL_FILE), Err(VfsError::ReadOnly)));
+        assert!(matches!(
+            fs.rename(a_ino, document::CONTENT_FILE, a_ino, FULL_FILE),
+            Err(VfsError::ReadOnly)
+        ));
+    }
+
+    #[test]
+    fn full_file_follows_edits_to_a_subsection() {
+        let (fs, _dir, file_ino) = mounted_with_options(
+            "# A\n\na\n\n## B\n\nb\n",
+            MountOptions {
+                full: true,
+                ..Default::default()
+            },
+        );
+        let a_ino = lookup_path(&fs, file_ino, &["A"]);
+        let full_ino = fs.lookup(a_ino, FULL_FILE).unwrap();
+        assert!(read_all(&fs, full_ino).contains("\nb\n"));
+
+        let b_content = lookup_path(&fs, file_ino, &["A", "B", document::CONTENT_FILE]);
+        fs.truncate(b_content).unwrap();
+        fs.write(b_content, 0, b"changed\n").unwrap();
+        assert_eq!(read_all(&fs, full_ino), "# A\n\na\n\n## B\n\nchanged\n");
+    }
+
+    #[test]
+    fn full_file_is_absent_without_the_flag() {
+        let (fs, _dir, file_ino) = mounted("# A\n\na\n");
+        let a_ino = lookup_path(&fs, file_ino, &["A"]);
+        assert!(matches!(fs.lookup(a_ino, FULL_FILE), Err(VfsError::NotFound)));
+        let (entries, _) = fs.readdir(a_ino, 0, 100).unwrap();
+        assert!(entries.iter().all(|e| e.name != FULL_FILE));
+    }
+
+    #[test]
+    fn kebab_slugs_name_directories_and_constrain_mkdir_and_rename() {
+        let (fs, dir, file_ino) = mounted_with_options(
+            "# Getting Started!\n\nbody\n",
+            MountOptions {
+                slug: SlugStyle::Kebab,
+                toc: true,
+                ..Default::default()
+            },
+        );
+        let section = lookup_path(&fs, file_ino, &["getting-started"]);
+        assert!(matches!(
+            fs.lookup(file_ino, "Getting Started!"),
+            Err(VfsError::NotFound)
+        ));
+        let toc = read_all(&fs, fs.lookup(file_ino, TOC_FILE).unwrap());
+        assert!(toc.contains("[getting-started](<getting-started/content.md>)"), "{toc}");
+
+        assert!(matches!(fs.mkdir(section, "Not Kebab"), Err(VfsError::Invalid)));
+        fs.mkdir(section, "install-steps").unwrap();
+        assert!(matches!(
+            fs.rename(section, "install-steps", section, "Install Steps"),
+            Err(VfsError::Invalid)
+        ));
+        fs.rename(section, "install-steps", section, "setup").unwrap();
+        let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
+        assert!(persisted.contains("## setup"), "{persisted}");
     }
 
     #[test]
@@ -1802,11 +2220,10 @@ mod tests {
         std::fs::write(&b, "# B Title\n\nintro\n").unwrap();
         let fs = MqFs::new(
             vec![(a, vec!["a".into()]), (b, vec!["b".into()])],
-            false,
-            false,
-            true,
-            false,
-            None,
+            MountOptions {
+                toc: true,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -1814,9 +2231,9 @@ mod tests {
         let (bytes, _) = fs.read(toc_ino, 0, 4096).unwrap();
         let toc = String::from_utf8(bytes).unwrap();
         assert!(toc.contains("## a"));
-        assert!(toc.contains("[A Title](a/A Title/content.md)"));
+        assert!(toc.contains("[A Title](<a/A Title/content.md>)"));
         assert!(toc.contains("## b"));
-        assert!(toc.contains("[B Title](b/B Title/content.md)"));
+        assert!(toc.contains("[B Title](<b/B Title/content.md>)"));
 
         let (entries, _) = fs.readdir(ROOT_INO, 0, 100).unwrap();
         let toc_entry = entries.iter().find(|e| e.name == TOC_FILE).unwrap();
@@ -1859,11 +2276,10 @@ mod tests {
 
         let fs = MqFs::new(
             vec![(path.clone(), vec!["doc".to_string()])],
-            false,
-            false,
-            false,
-            true,
-            None,
+            MountOptions {
+                backup: true,
+                ..Default::default()
+            },
         )
         .unwrap();
         let (entries, _) = fs.readdir(fs.root_ino(), 0, 100).unwrap();
@@ -1891,11 +2307,10 @@ mod tests {
 
         let fs = MqFs::new(
             vec![(path.clone(), vec!["doc".to_string()])],
-            false,
-            false,
-            false,
-            true,
-            None,
+            MountOptions {
+                backup: true,
+                ..Default::default()
+            },
         )
         .unwrap();
         let (entries, _) = fs.readdir(fs.root_ino(), 0, 100).unwrap();
@@ -1919,11 +2334,10 @@ mod tests {
 
         let fs = MqFs::new(
             vec![(path.clone(), vec!["doc".to_string()])],
-            false,
-            false,
-            false,
-            false,
-            Some(filter),
+            MountOptions {
+                filter: Some(filter),
+                ..Default::default()
+            },
         )
         .unwrap();
         let (entries, _) = fs.readdir(fs.root_ino(), 0, 100).unwrap();

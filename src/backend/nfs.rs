@@ -233,6 +233,28 @@ fn mount_nfs(mountpoint: &Path, port: u16, readonly: bool, name: &str) -> miette
         &format!("localhost:/{name}"),
         &mountpoint.to_string_lossy(),
     ]))
+    .map_err(|e| match linux_mount_hint() {
+        Some(hint) => miette::miette!(help = hint, "{e}"),
+        None => e,
+    })
+}
+
+/// The usual reasons `mount -t nfs` fails on Linux, checked in the order a
+/// user would need to fix them.
+#[cfg(target_os = "linux")]
+fn linux_mount_hint() -> Option<&'static str> {
+    let has_helper = ["/sbin/mount.nfs", "/usr/sbin/mount.nfs"]
+        .iter()
+        .any(|p| Path::new(p).exists());
+    if !has_helper {
+        return Some(
+            "the NFS client isn't installed; install it first (`sudo apt install nfs-common` on Debian/Ubuntu, `sudo dnf install nfs-utils` on Fedora)",
+        );
+    }
+    if unsafe { libc::geteuid() } != 0 {
+        return Some("mounting NFS on Linux requires root; re-run the same command with `sudo`");
+    }
+    None
 }
 
 fn run_mount_command(cmd: &mut Command) -> miette::Result<()> {
