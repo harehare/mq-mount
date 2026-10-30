@@ -5,7 +5,7 @@
 
 use std::ops::Range;
 
-use mq_markdown::{Heading, Markdown, Node, Point, Position, Text};
+use mq_markdown::{Heading, HeadingDepth, Markdown, Node, Point, Position, Text};
 use rustc_hash::FxHashMap;
 
 /// The canonical file name for a section's own body content.
@@ -161,7 +161,7 @@ impl SectionTree {
             let Node::Heading(Heading { depth, .. }) = &nodes[idx] else {
                 unreachable!("loop invariant: idx always lands on a Heading node")
             };
-            let depth = *depth;
+            let depth = depth.get();
 
             // Close whichever section is currently accumulating content: the
             // very next heading (any depth) always ends its own_content_range.
@@ -304,10 +304,10 @@ impl Baseline {
             let start = if i == 0 {
                 0
             } else {
-                line_offset(nodes[range.start].position()?.start.line)?
+                line_offset(nodes[range.start].position()?.start.line as usize)?
             };
             let end = match starts.get(i + 1) {
-                Some(&next) => line_offset(nodes[next].position()?.start.line)?,
+                Some(&next) => line_offset(nodes[next].position()?.start.line as usize)?,
                 None => source.len(),
             };
             if start > end {
@@ -548,7 +548,7 @@ impl Document {
             return Err(MutationError::AlreadyExists(name.to_string()));
         }
         let heading = Node::Heading(Heading {
-            depth: parent.depth.saturating_add(1).max(1),
+            depth: HeadingDepth::saturating(i64::from(parent.depth) + 1),
             values: vec![Node::Text(Text {
                 value: name.to_string(),
                 position: None,
@@ -607,7 +607,7 @@ impl Document {
     }
 
     fn normalize_missing_positions(nodes: &mut [Node]) {
-        let mut prev_end_line: Option<usize> = None;
+        let mut prev_end_line: Option<u32> = None;
         for node in nodes {
             if node.position().is_none() {
                 let line = prev_end_line.map_or(1, |l| l + 2);
@@ -624,6 +624,7 @@ impl Document {
         if delta == 0 {
             return;
         }
+        let delta = i32::try_from(delta).unwrap_or(if delta < 0 { i32::MIN } else { i32::MAX });
         for node in nodes {
             if let Some(mut pos) = node.position() {
                 pos.start.line = pos.start.line.saturating_add_signed(delta);
@@ -679,7 +680,7 @@ impl Document {
         let mut moved = self.splice_with_reflow(start..end, Vec::new());
         for node in &mut moved {
             if let Node::Heading(h) = node {
-                h.depth = (h.depth as i16 + depth_shift) as u8;
+                h.depth = HeadingDepth::saturating(i64::from(h.depth) + i64::from(depth_shift));
             }
         }
         if let Some(Node::Heading(h)) = moved.first_mut() {
@@ -1126,7 +1127,7 @@ mod tests {
         doc.rename_heading(tree.find(&["Title", "B"]).unwrap(), "Bee").unwrap();
         let out = doc.render();
         assert!(out.contains(title_chunk), "{out}");
-        assert!(out.contains("## Bee\n\n- b1\n- b2\n"), "{out}");
+        assert!(out.contains("## Bee\n\n+ b1\n+ b2\n"), "{out}");
         assert!(out.ends_with("## C\n\n1) c\n2) d"), "{out}");
 
         // Delete C (empty it first: rmdir is POSIX-strict).
