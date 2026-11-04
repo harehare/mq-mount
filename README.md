@@ -64,9 +64,32 @@ front matter
 - **Section-scoped edits.** Rewrite one section's `content.md` in isolation; `mq-mount` splices it back into the full document on save.
 - **Ad-hoc exploration.** `find`, `grep`, `fzf`, and any text editor work against the mount as-is — no Markdown-aware parser needed.
 
+## Performance
+
+Everything is in memory, and the work per operation is proportional to what it touches, not to the size of the file. Measured in-process (release build, Apple silicon, synthetic notes: 50 sections per chapter, each with a list, a code block and a table), including a 34 MB / 200,000-section file:
+
+| | 8 MB, 50k sections | 34 MB, 200k sections |
+|---|---|---|
+| open (parse + first `ls`) | 0.2 s | 0.9 s |
+| `ls` a chapter | 18 µs | 25 µs |
+| `cat` a section | < 1 µs (cached) | ~1 µs (cached) |
+| save a section (steady state) | 0.4 ms | 1.4 ms |
+| flush to disk after an edit | 4 ms | 23 ms |
+| `mkdir` (rebuilds the directory tree) | 48 ms | 0.25 s |
+
+The first save that changes how many Markdown blocks a section has also moves the blocks after it, which costs about 90 ms at 34 MB. Reproduce with:
+
+```sh
+MQ_BENCH_SECTIONS=200000 cargo test --release bench_large -- --ignored --nocapture
+```
+
+**Memory is the practical limit, not time.** The parsed document (mq-markdown's node tree) is far larger than the text: peak RSS in the runs above was about 0.4 GB for the 8 MB file and 1.6 GB for the 34 MB file, i.e. roughly 50x the file size. Plan on that when mounting very large files; a directory mount parses and keeps every `.md` file in it up front.
+
 ## Known limitations
 
-- **Edited sections are normalized; everything else is byte-exact.** A flush rewrites only the chunks of the file whose content actually changed (a chunk is the front matter, the preamble before the first heading, or one heading plus its own body). Every untouched chunk is copied from the original file byte for byte, so an unedited file is never rewritten, and saving one section leaves the rest of the file untouched. An edited chunk goes through mq-markdown's renderer, which can normalize its whitespace, list markers, and table padding. Pass `--backup` to snapshot each source file's pre-edit bytes to a sibling `<file>.orig` before its first write.
+- **Edits are saved as written; only new headings are normalized.** `content.md` shows a section's body exactly as it is in the source file (`*` bullets, unpadded tables, ... included), and whatever you save is written back as-is, keeping the heading line, the blank line after it, and the blank lines before the next heading. A flush rewrites only the chunks of the file whose content actually changed (a chunk is the front matter, the preamble before the first heading, or one heading plus its own body); every other chunk is copied from the original file byte for byte, so an unedited file is never rewritten and saving one section leaves the rest untouched. `mkdir`, and front matter edits, go through mq-markdown's renderer, which can normalize them; renaming or moving a heading rewrites just its heading line. Pass `--backup` to snapshot each source file's pre-edit bytes to a sibling `<file>.orig` before its first write.
+- **Style-only edits count.** Saving `- a` over `* a` changes the file even though both mean the same thing. Saving a section's exact current text is a no-op.
+- **Look-alike sections share formatting.** Two edited sections with the same heading text and an identical rendering share their saved text, so editing the style of one can restyle the other. Unedited sections are never affected.
 - **External changes are auto-reloaded, not merged.** An external edit is picked up on the next tick (~150ms) if there's no pending local edit. If there is, nothing is silently discarded: by default (`--on-conflict keep-both`) the mount's version is saved next to the source as `<file>.conflict-<unix time>`, the version on disk is loaded in its place, and the operation that hit the conflict fails with `ESTALE`/`STATUS_FILE_LOCK_CONFLICT`. Merge the two by hand, then keep working — no remount needed. The conflict file deliberately doesn't end in `.md`, so a directory mount never picks it up. `--on-conflict reject` restores the older behavior: keep refusing to write until you unmount and remount.
 - **A deferred write can be lost on a hard kill.** Writes are batched rather than flushed on every `write()`; a crash, `kill -9`, or forced termination can lose up to ~150ms of unflushed edits. A graceful stop (Ctrl-C, SIGTERM, `--stop`) always flushes first.
 - **External unmounts are noticed within a couple of seconds, not instantly.** macOS/Linux poll every 2s. On Windows, `--stop` forcibly terminates the process (no graceful cross-process signal); WinFSP still unmounts cleanly when its host process dies.
