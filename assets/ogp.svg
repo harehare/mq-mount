@@ -8,10 +8,10 @@
   <!-- Palette: ground #14201a, panel #1b2c23, line #2a3d32, text #e8f0ea, muted #8fa498, one accent #22D3EE -->
   <rect width="1200" height="630" fill="#14201a"/>
 
-  <!-- Logo: an M seated in a tray -->
-  <g transform="translate(26, 100) scale(1.7)" fill="none" stroke="#22D3EE" stroke-linejoin="miter" stroke-linecap="butt">
-    <path d="M9 50 L9 88 L91 88 L91 50" stroke-width="9"/>
-    <path d="M27 68 L27 10 L50 40 L73 10 L73 68" stroke-width="10" stroke-miterlimit="6"/>
+  <!-- Logo: an M inside a folder -->
+  <g transform="translate(26, 95) scale(1.7)" fill="none" stroke="#22D3EE" stroke-linejoin="miter" stroke-linecap="butt">
+    <path d="M8 18 L38 18 L46 28 L92 28 L92 82 L8 82 Z" stroke-width="8"/>
+    <path d="M28 70 L28 44 L50 62 L72 44 L72 70" stroke-width="8" stroke-miterlimit="6"/>
   </g>
 
   <!-- Brand: one text run so "-mount" shares the baseline and tracking of "mq" -->
