@@ -645,13 +645,18 @@ impl MountState {
     }
 
     fn find_section(&self, file_idx: usize, path: &[String]) -> Option<Section> {
+        self.find_section_ref(file_idx, path).cloned()
+    }
+
+    fn find_section_ref(&self, file_idx: usize, path: &[String]) -> Option<&Section> {
         let refs: Vec<&str> = path.iter().map(String::as_str).collect();
-        self.files[file_idx].tree.find(&refs).cloned()
+        self.files[file_idx].tree.find(&refs)
     }
 
     fn find_child_section(&self, file_idx: usize, parent: &[String], name: &str) -> Option<Section> {
-        self.find_section(file_idx, parent)
-            .and_then(|p| p.children.into_iter().find(|c| c.name == name))
+        self.find_section_ref(file_idx, parent)
+            .and_then(|p| p.children.iter().find(|c| c.name == name))
+            .cloned()
     }
 
     fn section_range(&self, file_idx: usize, path: &[String]) -> Option<Range<usize>> {
@@ -664,7 +669,7 @@ impl MountState {
 
     fn section_bytes(&self, file_idx: usize, path: &[String]) -> Vec<u8> {
         self.section_range(file_idx, path)
-            .map(|r| self.files[file_idx].document.render_range(r).into_bytes())
+            .map(|r| self.files[file_idx].document.body_text(r).into_bytes())
             .unwrap_or_default()
     }
 
@@ -687,10 +692,27 @@ impl MountState {
         let Some(range) = self.section_range(file_idx, dir_path) else {
             return Ok(());
         };
-        self.files[file_idx]
+        let edit = self.files[file_idx]
             .document
-            .replace_section_content(range, text)
+            .replace_section_content(range.clone(), text)
             .map_err(map_mutation_error)?;
+        if !edit.structural {
+            // A body-only edit leaves every directory name and inode as it
+            // was; only node indices after it move. Skip the full rebuild
+            // (tree, inode sync, cache) that would otherwise cost O(sections)
+            // on every `write()`.
+            if edit.delta != 0 {
+                self.files[file_idx]
+                    .tree
+                    .shift_after_edit(range.start, range.end, edit.delta);
+            }
+            self.content_cache.clear();
+            if defer {
+                self.files[file_idx].dirty = true;
+                return Ok(());
+            }
+            return self.persist(file_idx);
+        }
         if defer {
             self.rebuild_and_mark_dirty(file_idx);
             Ok(())
@@ -734,7 +756,7 @@ impl MountState {
     }
 
     fn has_heading_child(&self, file_idx: usize, parent_path: &[String], name: &str) -> bool {
-        self.find_section(file_idx, parent_path)
+        self.find_section_ref(file_idx, parent_path)
             .is_some_and(|s| s.children.iter().any(|c| c.name == name))
     }
 
@@ -746,8 +768,8 @@ impl MountState {
     }
 
     fn full_bytes(&self, file_idx: usize, path: &[String]) -> Vec<u8> {
-        self.find_section(file_idx, path)
-            .map(|section| self.files[file_idx].document.render_subtree(&section).into_bytes())
+        self.find_section_ref(file_idx, path)
+            .map(|section| self.files[file_idx].document.render_subtree(section).into_bytes())
             .unwrap_or_default()
     }
 
@@ -1406,7 +1428,10 @@ impl MountFs for MqFs {
         }
 
         let (file_idx, path) = state.dir_path(ino).ok_or(VfsError::NotDir)?;
-        let section = state.find_section(file_idx, &path).ok_or(VfsError::NotFound)?;
+        let section = state
+            .find_section_ref(file_idx, &path)
+            .map(Section::shallow)
+            .ok_or(VfsError::NotFound)?;
 
         let content_ino = state.files[file_idx]
             .inodes
@@ -1522,6 +1547,63 @@ mod tests {
         ino
     }
 
+    /// Large-file benchmark; run with
+    /// `MQ_BENCH_SECTIONS=20000 cargo test --release -- --ignored --nocapture bench_large`.
+    #[test]
+    #[ignore]
+    fn bench_large_file() {
+        use std::time::Instant;
+        let n: usize = std::env::var("MQ_BENCH_SECTIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5000);
+        let mut src = String::from("---\ntitle: big\n---\n\nPreamble.\n\n");
+        for i in 0..n / 50 {
+            src.push_str(&format!("# Chapter {i}\n\nIntro of chapter {i}.\n\n"));
+            for j in 0..50 {
+                src.push_str(&format!(
+                    "## Section {i}.{j}\n\nSome *body* text for section {i}.{j} with a [link](http://example.com).\n\n* item one\n* item two\n\n```rust\nfn f() {{}}\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n"
+                ));
+            }
+        }
+        eprintln!("source: {} sections, {:.1} MB", n, src.len() as f64 / 1e6);
+        let t = Instant::now();
+        let (fs, _dir, file_ino) = mounted(&src);
+        eprintln!("open + first readdir : {:?}", t.elapsed());
+
+        let t = Instant::now();
+        let ch = lookup_path(&fs, file_ino, &["Chapter 3"]);
+        let (entries, _) = fs.readdir(ch, 0, 1000).unwrap();
+        eprintln!("readdir chapter ({} entries): {:?}", entries.len(), t.elapsed());
+
+        let t = Instant::now();
+        let reps = 200;
+        for k in 0..reps {
+            let ino = lookup_path(
+                &fs,
+                file_ino,
+                &["Chapter 3", &format!("Section 3.{}", k % 50), document::CONTENT_FILE],
+            );
+            let _ = fs.read(ino, 0, 65536).unwrap();
+        }
+        eprintln!("lookup+read x{reps}: {:?} each", t.elapsed() / reps);
+
+        let ino = lookup_path(&fs, file_ino, &["Chapter 3", "Section 3.7", document::CONTENT_FILE]);
+        let t = Instant::now();
+        for k in 0..20 {
+            fs.write(ino, 0, format!("edited {k}\n").as_bytes()).unwrap();
+        }
+        eprintln!("write x20 (deferred): {:?} each", t.elapsed() / 20);
+        let t = Instant::now();
+        fs.flush();
+        eprintln!("flush (render + disk): {:?}", t.elapsed());
+
+        let t = Instant::now();
+        fs.mkdir(ch, "new section").unwrap();
+        eprintln!("mkdir: {:?}", t.elapsed());
+        fs.flush();
+    }
+
     #[test]
     fn write_then_read_round_trips_through_content_md() {
         let (fs, dir, file_ino) = mounted("# Title\n\noriginal body\n");
@@ -1541,6 +1623,50 @@ mod tests {
         fs.flush();
         let persisted = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
         assert!(persisted.contains("new body"), "persisted doc was: {persisted}");
+    }
+
+    #[test]
+    fn content_md_serves_the_source_text_and_saves_edits_as_written() {
+        let src = "# Title\n\n* one\n* two\n\n|a|b|\n|-|-|\n|1|2|\n\n## Sub\n\n+ x\n";
+        let (fs, dir, file_ino) = mounted(src);
+        let content_ino = lookup_path(&fs, file_ino, &["Title", document::CONTENT_FILE]);
+
+        let (bytes, _) = fs.read(content_ino, 0, 4096).unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "* one\n* two\n\n|a|b|\n|-|-|\n|1|2|\n"
+        );
+
+        // An editor rewriting the file: truncate, then write the new text.
+        fs.truncate(content_ino).unwrap();
+        let edited = "* one\n* two\n* three\n\n|a|b|\n|-|-|\n|1|2|\n";
+        fs.write(content_ino, 0, edited.as_bytes()).unwrap();
+        fs.flush();
+
+        let on_disk = std::fs::read_to_string(dir.path().join("doc.md")).unwrap();
+        assert_eq!(on_disk, src.replace("* two\n", "* two\n* three\n"));
+    }
+
+    #[test]
+    fn a_body_edit_does_not_disturb_other_sections_or_their_inodes() {
+        let (fs, _dir, file_ino) = mounted("# A\n\na\n\n## A1\n\na1\n\n# B\n\nb\n");
+        let a1 = lookup_path(&fs, file_ino, &["A", "A1", document::CONTENT_FILE]);
+        let b = lookup_path(&fs, file_ino, &["B", document::CONTENT_FILE]);
+        let a = lookup_path(&fs, file_ino, &["A", document::CONTENT_FILE]);
+
+        // A body edit that adds and removes nodes shifts everything after it.
+        fs.truncate(a).unwrap();
+        fs.write(a, 0, b"one\n\ntwo\n\nthree\n").unwrap();
+        for (ino, want) in [(a, "one\n\ntwo\n\nthree\n"), (a1, "a1\n"), (b, "b\n")] {
+            let (bytes, _) = fs.read(ino, 0, 4096).unwrap();
+            assert_eq!(String::from_utf8(bytes).unwrap(), want);
+        }
+        // Inodes survive, and a new write still lands in the right place.
+        assert_eq!(lookup_path(&fs, file_ino, &["B", document::CONTENT_FILE]), b);
+        fs.truncate(b).unwrap();
+        fs.write(b, 0, b"B!\n").unwrap();
+        let (bytes, _) = fs.read(b, 0, 4096).unwrap();
+        assert_eq!(bytes, b"B!\n");
     }
 
     #[test]
