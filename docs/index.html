@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f7fbfc" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#14201a" media="(prefers-color-scheme: dark)">
+<title>mq-mount: mount Markdown as a filesystem</title>
+<meta name="description" content="mq-mount mounts Markdown files as a virtual filesystem. Headings become directories and section bodies become files, so ls, cat, grep and any editor just work.">
+<meta property="og:title" content="mq-mount: mount Markdown as a filesystem">
+<meta property="og:description" content="Headings become directories, section bodies become files. Browse and edit with ls, cat, grep or any editor.">
+<meta property="og:image" content="https://mount.mqlang.org/assets/og-image.png">
+<meta property="og:url" content="https://mount.mqlang.org/">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@700&display=swap" rel="stylesheet">
+<style>
+/* Same structure as mq-task, with the accent turned from green to cyan.
+   Dark surfaces and text are mq-task's; the light theme keeps the same roles. */
+:root{
+  --bg:#f7fbfc;--panel:#e8f3f6;--panel-hi:#d8eaef;--deep:#ffffff;--fg:#0b2530;--muted:#46636d;
+  --accent:#06B6D4;--accent-text:#0891B2;--link:#0E7490;--on-accent:#04222B;
+  --border:rgba(8,145,178,.22);--nav-bg:rgba(247,251,252,.9);--code-fg:#1b3f4b;--code-bg:rgba(8,145,178,.1);
+  --shadow:rgba(8,60,80,.18);--prompt:#0E7490;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#14201a;--panel:#24372c;--panel-hi:#2f4639;--deep:#0f1914;--fg:#e8f0ea;--muted:#8fa498;
+    --accent:#22D3EE;--accent-text:#22D3EE;--link:#67E8F9;--on-accent:#0f1914;
+    --border:rgba(47,70,57,.5);--nav-bg:rgba(20,32,26,.9);--code-fg:#c3d3c8;--code-bg:rgba(34,211,238,.12);
+    --shadow:rgba(0,0,0,.35);--prompt:#22D3EE;
+  }
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.65 Inter,system-ui,-apple-system,"Segoe UI",sans-serif}
+a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
+code{background:var(--code-bg);color:var(--link);padding:1px 6px;border-radius:2px;font-size:.9em}
+::selection{background:var(--accent);color:var(--on-accent)}
+.wrap{max-width:1180px;margin:0 auto;padding:0 24px}
+nav{position:sticky;top:0;z-index:10;background:var(--nav-bg);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+nav .wrap{display:flex;align-items:center;gap:20px;height:64px}
+nav .brand{display:flex;align-items:center;gap:8px;white-space:nowrap;font:700 1.4rem "Space Grotesk",sans-serif;color:var(--link);letter-spacing:-.02em}
+nav .brand:hover{text-decoration:none}
+nav .brand img{width:36px;height:36px}
+nav .sp{flex:1}
+nav a.link{color:var(--muted);font-size:.9rem}nav a.link:hover{color:var(--fg);text-decoration:none}
+.gh{width:18px;height:18px;vertical-align:-3px;margin-right:8px}
+.hero{padding:80px 0 56px}
+.hero .wrap{display:grid;grid-template-columns:minmax(0,1fr);gap:48px}
+.hero .wrap>*{min-width:0}
+.hero .wrap>div:first-child{width:100%;max-width:760px;margin:0 auto;text-align:center}
+.hero .wrap>.term{width:100%;max-width:1100px;margin:0 auto}
+.hero h1{font:700 clamp(2.4rem,5vw,4rem)/1.02 "Space Grotesk",sans-serif;letter-spacing:-.04em;margin:0 0 20px}
+.hero h1 span{color:var(--accent-text)}
+.hero p{color:var(--muted);font-size:1.15rem;margin:0 auto 28px;max-width:600px}
+.btn{display:inline-block;padding:10px 20px;border-radius:2px;border:1px solid var(--panel-hi);color:var(--fg);margin:0 8px 8px 0;transition:background-color .2s,border-color .2s,color .2s,transform .2s}
+.btn:hover{border-color:var(--accent);color:var(--link);text-decoration:none;transform:translateY(-2px)}
+.btn:active{transform:scale(.98)}
+@media(prefers-reduced-motion:reduce){.btn{transition:none}.btn:hover{transform:none}}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--on-accent);font-weight:600}
+.btn.primary:hover{background:var(--panel);border-color:var(--accent);color:var(--link)}
+.install{display:inline-block;max-width:100%;margin-top:8px;text-align:left;font-size:13px;white-space:pre-wrap;word-break:break-all}
+.term{background:#0f1914;border:1px solid var(--border);border-radius:8px;overflow:hidden;box-shadow:0 20px 50px var(--shadow)}
+.term .bar{display:flex;gap:6px;padding:10px 14px;background:rgba(36,55,44,.5)}
+.term .bar i{width:12px;height:12px;border-radius:50%;background:#2f4639}
+.term .bar i:nth-child(1){background:#ef4444aa}.term .bar i:nth-child(2){background:#c3d3c8aa}.term .bar i:nth-child(3){background:#22D3EEaa}
+.term img{display:block;width:100%;height:auto}
+pre{background:var(--deep);border:1px solid var(--border);border-radius:8px;padding:18px;overflow:auto;font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0;color:var(--code-fg)}
+pre .p{color:var(--prompt)}pre .c{color:var(--muted)}pre .o{color:var(--muted)}
+section{padding:56px 0}
+.center{text-align:center;max-width:680px;margin:0 auto 40px}
+h2{font-size:2rem;margin:0 0 12px;letter-spacing:-.02em}
+.lead{color:var(--muted)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:16px}
+.card{background:var(--panel);border-radius:8px;padding:22px;transition:background .2s}
+.card:hover{background:var(--panel-hi)}
+.card h3{margin:0 0 6px;font-size:1.05rem}
+.card p{margin:0;color:var(--muted);font-size:.95rem}
+.card code{white-space:nowrap}
+.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:32px;align-items:center}
+.two>*{min-width:0}
+.stack{max-width:860px;margin:0 auto}
+.stack>*+*{margin-top:20px}
+.stack h3{margin:0 0 8px;font-size:1.05rem}
+footer{border-top:1px solid var(--border);padding:28px 0;color:var(--muted);font-size:.9rem;text-align:center}
+@media(max-width:860px){.hero{padding-top:48px}}
+@media(max-width:640px){
+.wrap{padding:0 16px}
+nav .wrap{gap:14px;height:56px}
+nav .brand{font-size:1.2rem}
+nav .brand img{width:28px;height:28px}
+nav a.link.gh-link span{display:none}
+nav a.link[href="#usage"],nav a.link[href="https://mqlang.org/"]{display:none}
+nav .gh{margin-right:0}
+.hero{padding:36px 0 32px}
+.hero .wrap{gap:32px}
+.hero p{font-size:1.05rem}
+.btn{display:block;text-align:center;margin:0 0 10px}
+.install{display:block;font-size:12px;padding:14px}
+pre{font-size:13px;padding:14px}
+section{padding:36px 0}
+h2{font-size:1.6rem}
+.center{margin-bottom:28px}
+}
+@media(max-width:420px){.hero h1{font-size:2.1rem}nav a.link[href="#features"],nav a.link[href$="#readme"]{display:none}}
+</style>
+</head>
+<body>
+<nav>
+  <div class="wrap">
+    <a class="brand" href="/"><img src="assets/logo.svg" alt="">mq-mount</a>
+    <a class="link" href="#features">Features</a>
+    <a class="link" href="#usage">Usage</a>
+    <span class="sp"></span>
+    <a class="link" href="https://github.com/harehare/mq-mount#readme">Documentation</a>
+    <a class="link" href="https://mqlang.org/">mq</a>
+    <a class="link gh-link" href="https://github.com/harehare/mq-mount" aria-label="GitHub"><svg class="gh" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61-.546-1.385-1.335-1.755-1.335-1.755-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 21.795 24 17.295 24 12c0-6.63-5.37-12-12-12"/></svg><span>GitHub</span></a>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <div>
+      <h1>Your Markdown is<br>a <span>filesystem.</span></h1>
+      <p>mq-mount mounts Markdown files as a virtual filesystem. Headings become directories and section bodies become files, so <code>ls</code>, <code>cat</code>, <code>grep</code> and any editor just work.</p>
+      <a class="btn primary" href="#install">Get started</a>
+      <a class="btn" href="https://github.com/harehare/mq-mount#readme">Read the docs</a>
+      <a class="btn" href="https://github.com/harehare/mq-mount"><svg class="gh" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61-.546-1.385-1.335-1.755-1.335-1.755-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 21.795 24 17.295 24 12c0-6.63-5.37-12-12-12"/></svg>View on GitHub</a>
+      <pre class="install">curl -fsSL https://raw.githubusercontent.com/harehare/mq-mount/main/bin/install.sh | bash</pre>
+    </div>
+    <div class="term">
+      <div class="bar"><i></i><i></i><i></i></div>
+      <img src="assets/demo.gif" alt="mq-mount demo: mounting a Markdown file in the background, then ls and cat on a section, and editing it">
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap two">
+    <div>
+      <h2>Headings become directories</h2>
+      <p class="lead">Each heading is a directory, and the text under it is its <code>content.md</code>. Nesting follows heading depth, so <code>cd</code> and <code>ls</code> walk the document like a tree.</p>
+    </div>
+<pre><span class="c">guide.md                  mounted at /tmp/mnt/guide/</span>
+
+# Getting Started    <span class="p">-&gt;</span>   getting-started/content.md
+# Usage              <span class="p">-&gt;</span>   usage/content.md
+## Tips              <span class="p">-&gt;</span>   usage/tips/content.md</pre>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <div class="center"><h2>Features</h2><p class="lead">Everything you need to treat a document as files, without leaving the shell.</p></div>
+    <div class="grid">
+      <div class="card"><h3>Read-only by default</h3><p>Nothing touches your files until you pass <code>--write</code>. <code>--filter</code> always mounts read-only.</p></div>
+      <div class="card"><h3>Section-scoped edits</h3><p>Rewrite one section's <code>content.md</code>. Only that part of the source changes; every other byte stays put.</p></div>
+      <div class="card"><h3>Your formatting stays</h3><p>Edits are saved as you wrote them. List markers, table padding and blank lines are not re-rendered.</p></div>
+      <div class="card"><h3>Cheap for agents</h3><p><code>grep -r</code> for a heading, then <code>cat</code> one section. <code>--toc</code> gives the outline and <code>--full</code> a whole chapter in one read.</p></div>
+      <div class="card"><h3>Filters &amp; globs</h3><p><code>--filter</code> takes an mq query. <code>--include</code> and <code>--exclude</code> pick the files in a directory mount.</p></div>
+      <div class="card"><h3>Shell-friendly names</h3><p><code>--slug kebab</code> turns <code>Getting Started</code> into <code>getting-started</code>. Easier to type, easier to script.</p></div>
+      <div class="card"><h3>Plays well with editors</h3><p>Atomic saves from vim and VS Code work. A conflicting change on disk is kept in <code>.conflict-&lt;time&gt;</code>, never dropped.</p></div>
+      <div class="card"><h3>Big documents</h3><p>A 34 MB file with 200,000 sections opens in about a second on an Apple silicon Mac, and a save takes milliseconds.</p></div>
+      <div class="card"><h3>Background mounts</h3><p><code>-d</code>, <code>--list --json</code> and <code>--stop</code>, plus defaults in <code>.mq-mount.toml</code>.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="usage">
+  <div class="wrap">
+    <div class="center"><h2>See it work</h2><p class="lead">Mount a file, read a section, append to it and add a subsection. The source file changes, and nothing else does.</p></div>
+    <div class="stack">
+<pre><span class="p">$</span> cat guide.md
+# Getting Started
+
+Install the binary and mount a file.
+
+# Usage
+
+Browse it with ls and cat.
+
+<span class="p">$</span> mq-mount guide.md /tmp/mnt --write --slug kebab -d
+<span class="p">$</span> ls /tmp/mnt/guide
+content.md  getting-started  usage
+<span class="p">$</span> cat /tmp/mnt/guide/getting-started/content.md
+Install the binary and mount a file.
+<span class="p">$</span> echo "Run mq-mount --help for options." &gt;&gt; /tmp/mnt/guide/getting-started/content.md
+<span class="p">$</span> mkdir /tmp/mnt/guide/usage/tips
+<span class="p">$</span> cat guide.md
+# Getting Started
+
+Install the binary and mount a file.
+Run mq-mount --help for options.
+
+# Usage
+
+Browse it with ls and cat.
+
+## tips
+<span class="p">$</span> mq-mount --stop /tmp/mnt</pre>
+    </div>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <div class="center"><h2>Install</h2><p class="lead">One binary. Pick whichever way you like.</p></div>
+    <div class="stack">
+      <div><h3>Install script</h3>
+<pre>curl -fsSL https://raw.githubusercontent.com/harehare/mq-mount/main/bin/install.sh | bash</pre></div>
+      <div><h3>cargo-binstall</h3>
+<pre>cargo binstall mq-mount</pre></div>
+      <div><h3>From source</h3>
+<pre>git clone https://github.com/harehare/mq-mount
+cd mq-mount
+cargo build --release</pre></div>
+    </div>
+    <div class="grid" style="margin-top:32px">
+      <div class="card"><h3>macOS</h3><p>Uses the built-in NFS client. No packages to install.</p></div>
+      <div class="card"><h3>Linux</h3><p>Needs the <code>mount.nfs</code> helper (<code>nfs-common</code> or <code>nfs-utils</code>) and <code>sudo</code>.</p></div>
+      <div class="card"><h3>Windows</h3><p>Needs <a href="https://winfsp.dev">WinFSP</a>. Experimental: not yet verified on a real Windows machine.</p></div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    MIT licensed · Built on <a href="https://mqlang.org/">mq</a> ·
+    <a href="https://github.com/harehare/mq-mount">github.com/harehare/mq-mount</a>
+  </div>
+</footer>
+</body>
+</html>

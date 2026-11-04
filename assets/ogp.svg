@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" xml:space="preserve" viewBox="0 0 1200 630" width="1200" height="630">
+  <defs>
+    <clipPath id="card">
+      <rect x="664" y="65" width="490" height="500" rx="8"/>
+    </clipPath>
+  </defs>
+
+  <!-- Palette: ground #14201a, panel #1b2c23, line #2a3d32, text #e8f0ea, muted #8fa498, one accent #22D3EE -->
+  <rect width="1200" height="630" fill="#14201a"/>
+
+  <!-- Logo: an M seated in a tray -->
+  <g transform="translate(26, 100) scale(1.7)" fill="none" stroke="#22D3EE" stroke-linejoin="miter" stroke-linecap="butt">
+    <path d="M9 50 L9 88 L91 88 L91 50" stroke-width="9"/>
+    <path d="M27 68 L27 10 L50 40 L73 10 L73 68" stroke-width="10" stroke-miterlimit="6"/>
+  </g>
+
+  <!-- Brand: one text run so "-mount" shares the baseline and tracking of "mq" -->
+  <text x="206" y="206"
+    font-family="'IBM Plex Mono', monospace" font-size="84" font-weight="700"
+    letter-spacing="-2" fill="#e8f0ea">mq-mount</text>
+
+  <!-- Tagline as two headings -->
+  <text x="60" y="308" font-family="'IBM Plex Mono', monospace" font-size="34" font-weight="700" fill="#22D3EE">#</text>
+  <text x="104" y="308" font-family="'IBM Plex Mono', monospace" font-size="34" font-weight="700" fill="#e8f0ea">Markdown,</text>
+  <text x="60" y="352" font-family="'IBM Plex Mono', monospace" font-size="34" font-weight="700" fill="#22D3EE">##</text>
+  <text x="124" y="352" font-family="'IBM Plex Mono', monospace" font-size="34" font-weight="700" fill="#e8f0ea">but it <tspan fill="#22D3EE">mounts.</tspan></text>
+
+  <!-- Description -->
+  <text x="60" y="414" font-family="'IBM Plex Sans', Arial, sans-serif" font-size="20" fill="#8fa498">Mount Markdown files as a filesystem. Headings become</text>
+  <text x="60" y="442" font-family="'IBM Plex Sans', Arial, sans-serif" font-size="20" fill="#8fa498">directories and sections become files.</text>
+
+  <!-- Command -->
+  <rect x="60.5" y="472.5" width="318" height="48" rx="4" fill="#1b2c23" stroke="#2a3d32"/>
+  <text x="82" y="503" font-family="'IBM Plex Mono', monospace" font-size="17" fill="#22D3EE">$</text>
+  <text x="102" y="503" font-family="'IBM Plex Mono', monospace" font-size="17" font-weight="500" fill="#e8f0ea">mq-mount guide.md /mnt</text>
+
+  <!-- Source card -->
+  <rect x="664.5" y="65.5" width="489" height="499" rx="8" fill="#1b2c23" stroke="#2a3d32"/>
+  <g clip-path="url(#card)">
+    <text x="688" y="94" font-family="'IBM Plex Mono', monospace" font-size="14" fill="#8fa498">guide.md</text>
+    <line x1="664" y1="109.5" x2="1154" y2="109.5" stroke="#2a3d32"/>
+
+    <!-- # Getting Started -> getting-started/ -->
+    <path d="M690 138 L690 160 L716 160 L716 142 L702 142 L699 138 Z" fill="#22D3EE"/>
+    <text x="732" y="158" font-family="'IBM Plex Mono', monospace" font-size="20" font-weight="500" fill="#e8f0ea"># Getting Started</text>
+    <text x="1130" y="157" text-anchor="end" font-family="'IBM Plex Mono', monospace" font-size="14" fill="#8fa498">getting-started/</text>
+    <line x1="688" y1="184.5" x2="1130" y2="184.5" stroke="#24372c"/>
+
+    <!-- # Usage -> usage/ -->
+    <path d="M690 204 L690 226 L716 226 L716 208 L702 208 L699 204 Z" fill="#22D3EE"/>
+    <text x="732" y="224" font-family="'IBM Plex Mono', monospace" font-size="20" font-weight="700" fill="#e8f0ea"># Usage</text>
+    <text x="1130" y="223" text-anchor="end" font-family="'IBM Plex Mono', monospace" font-size="14" fill="#22D3EE">usage/</text>
+    <line x1="688" y1="250.5" x2="1130" y2="250.5" stroke="#24372c"/>
+
+    <!-- ## tips -> usage/tips/ -->
+    <path d="M719.5 272.5 L719.5 290.5 L739.5 290.5 L739.5 276.5 L729.5 276.5 L726.5 272.5 Z" fill="none" stroke="#22D3EE" stroke-width="3" stroke-linejoin="miter"/>
+    <text x="756" y="290" font-family="'IBM Plex Mono', monospace" font-size="20" font-weight="500" fill="#e8f0ea">## tips</text>
+    <text x="1130" y="289" text-anchor="end" font-family="'IBM Plex Mono', monospace" font-size="14" fill="#8fa498">usage/tips/</text>
+    <line x1="688" y1="316.5" x2="1130" y2="316.5" stroke="#24372c"/>
+
+    <!-- body of a section -> content.md -->
+    <text x="732" y="356" font-family="'IBM Plex Mono', monospace" font-size="20" font-weight="500" fill="#5b7466">Some text...</text>
+    <text x="1130" y="355" text-anchor="end" font-family="'IBM Plex Mono', monospace" font-size="14" fill="#5b7466">content.md</text>
+
+    <!-- Terminal -->
+    <rect x="664" y="420" width="490" height="145" fill="#0f1914"/>
+    <text x="688" y="456" font-family="'IBM Plex Mono', monospace" font-size="16" fill="#22D3EE">$</text>
+    <text x="708" y="456" font-family="'IBM Plex Mono', monospace" font-size="16" fill="#e8f0ea">ls /mnt/guide</text>
+    <text x="688" y="488" font-family="'IBM Plex Mono', monospace" font-size="15" fill="#8fa498">content.md  getting-started  usage</text>
+    <text x="688" y="528" font-family="'IBM Plex Mono', monospace" font-size="16" fill="#22D3EE">$</text>
+    <text x="708" y="528" font-family="'IBM Plex Mono', monospace" font-size="16" fill="#e8f0ea">cat usage/tips/content.md</text>
+    <rect x="956" y="515" width="9" height="16" fill="#22D3EE"/>
+  </g>
+</svg>

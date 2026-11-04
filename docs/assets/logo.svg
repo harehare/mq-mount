@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <style>
+    path { stroke: #0891B2; }
+    @media (prefers-color-scheme: dark) { path { stroke: #22D3EE; } }
+  </style>
+  <!-- Mount point: a tray with an open top -->
+  <path d="M9 50 L9 88 L91 88 L91 50" fill="none" stroke-width="9" stroke-linejoin="miter" stroke-linecap="butt"/>
+  <!-- An "M" (Markdown) seated in the tray -->
+  <path d="M27 68 L27 10 L50 40 L73 10 L73 68" fill="none" stroke-width="10" stroke-linejoin="miter" stroke-miterlimit="6" stroke-linecap="butt"/>
+</svg>
