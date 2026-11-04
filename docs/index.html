@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#f7fbfc" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#14201a" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#07090b" media="(prefers-color-scheme: dark)">
 <title>mq-mount: mount Markdown as a filesystem</title>
 <meta name="description" content="mq-mount mounts Markdown files as a virtual filesystem. Headings become directories and section bodies become files, so ls, cat, grep and any editor just work.">
 <meta property="og:title" content="mq-mount: mount Markdown as a filesystem">
@@ -28,9 +28,9 @@
 }
 @media (prefers-color-scheme:dark){
   :root{
-    --bg:#14201a;--panel:#24372c;--panel-hi:#2f4639;--deep:#0f1914;--fg:#e8f0ea;--muted:#8fa498;
-    --accent:#22D3EE;--accent-text:#22D3EE;--link:#67E8F9;--on-accent:#0f1914;
-    --border:rgba(47,70,57,.5);--nav-bg:rgba(20,32,26,.9);--code-fg:#c3d3c8;--code-bg:rgba(34,211,238,.12);
+    --bg:#07090b;--panel:#12171b;--panel-hi:#1b2227;--deep:#030506;--fg:#e8eef0;--muted:#8a9aa1;
+    --accent:#22D3EE;--accent-text:#22D3EE;--link:#67E8F9;--on-accent:#03181d;
+    --border:rgba(60,80,90,.45);--nav-bg:rgba(7,9,11,.88);--code-fg:#c3d3d8;--code-bg:rgba(34,211,238,.12);
     --shadow:rgba(0,0,0,.35);--prompt:#22D3EE;
   }
 }
@@ -64,9 +64,9 @@ nav a.link{color:var(--muted);font-size:.9rem}nav a.link:hover{color:var(--fg);t
 .btn.primary{background:var(--accent);border-color:var(--accent);color:var(--on-accent);font-weight:600}
 .btn.primary:hover{background:var(--panel);border-color:var(--accent);color:var(--link)}
 .install{display:inline-block;max-width:100%;margin-top:8px;text-align:left;font-size:13px;white-space:pre-wrap;word-break:break-all}
-.term{background:#0f1914;border:1px solid var(--border);border-radius:8px;overflow:hidden;box-shadow:0 20px 50px var(--shadow)}
-.term .bar{display:flex;gap:6px;padding:10px 14px;background:rgba(36,55,44,.5)}
-.term .bar i{width:12px;height:12px;border-radius:50%;background:#2f4639}
+.term{background:#030506;border:1px solid var(--border);border-radius:8px;overflow:hidden;box-shadow:0 20px 50px var(--shadow)}
+.term .bar{display:flex;gap:6px;padding:10px 14px;background:rgba(27,34,39,.7)}
+.term .bar i{width:12px;height:12px;border-radius:50%;background:#1b2227}
 .term .bar i:nth-child(1){background:#ef4444aa}.term .bar i:nth-child(2){background:#c3d3c8aa}.term .bar i:nth-child(3){background:#22D3EEaa}
 .term img{display:block;width:100%;height:auto}
 pre{background:var(--deep);border:1px solid var(--border);border-radius:8px;padding:18px;overflow:auto;font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0;color:var(--code-fg)}
