@@ -23,27 +23,6 @@ Companion tool for [mq](https://github.com/harehare/mq), a jq-like CLI for Markd
 - **Section-scoped edits.** Rewrite one section's `content.md`; `mq-mount` splices it back into the document on save.
 - **Ad-hoc exploration.** `find`, `grep`, `fzf`, and any editor work as-is.
 
-## Performance
-
-Everything is in memory, and the work per operation is proportional to what it touches, not to the size of the file. Measured in-process (release build, Apple silicon, synthetic notes: 50 sections per chapter, each with a list, a code block and a table), including a 34 MB / 200,000-section file:
-
-| | 8 MB, 50k sections | 34 MB, 200k sections |
-|---|---|---|
-| open (parse + first `ls`) | 0.2 s | 0.9 s |
-| `ls` a chapter | 18 µs | 25 µs |
-| `cat` a section | < 1 µs (cached) | ~1 µs (cached) |
-| save a section (steady state) | 0.4 ms | 1.4 ms |
-| flush to disk after an edit | 4 ms | 23 ms |
-| `mkdir` (rebuilds the directory tree) | 48 ms | 0.25 s |
-
-The first save that changes how many Markdown blocks a section has also moves the blocks after it, which costs about 90 ms at 34 MB. Reproduce with:
-
-```sh
-MQ_BENCH_SECTIONS=200000 cargo test --release bench_large -- --ignored --nocapture
-```
-
-**Memory is the practical limit, not time.** The parsed document (mq-markdown's node tree) is far larger than the text: peak RSS in the runs above was about 0.4 GB for the 8 MB file and 1.6 GB for the 34 MB file, i.e. roughly 50x the file size. Plan on that when mounting very large files; a directory mount parses and keeps every `.md` file in it up front.
-
 ## Installation
 
 ```sh
