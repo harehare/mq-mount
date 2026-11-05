@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <style>
+    path { stroke: #0891B2; }
+    @media (prefers-color-scheme: dark) { path { stroke: #22D3EE; } }
+  </style>
+  <!-- A folder: Markdown headings become directories -->
+  <path d="M8 18 L38 18 L46 28 L92 28 L92 82 L8 82 Z" fill="none" stroke-width="8" stroke-linejoin="miter" stroke-linecap="butt"/>
+  <!-- An "M" (Markdown) inside -->
+  <path d="M28 70 L28 44 L50 62 L72 44 L72 70" fill="none" stroke-width="8" stroke-linejoin="miter" stroke-miterlimit="6" stroke-linecap="butt"/>
+</svg>
