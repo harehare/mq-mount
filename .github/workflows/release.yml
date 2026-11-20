@@ -14,7 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions-rust-lang/setup-rust-toolchain@v2.0.0
+        with:
+          cache: false
+          rustflags: ""
       - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo build --all-features --locked
       - run: cargo test --all-features --locked
@@ -45,9 +48,11 @@ jobs:
             ext: ".exe"
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions-rust-lang/setup-rust-toolchain@v2.0.0
         with:
-          targets: ${{ matrix.target }}
+          target: ${{ matrix.target }}
+          cache: false
+          rustflags: ""
       # winfsp-sys builds against the headers/import libs the installer
       # lays down; only the delayload thunk ships in the binary, so the
       # WinFSP driver itself doesn't need to be present on the runner.

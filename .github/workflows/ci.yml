@@ -13,18 +13,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions-rust-lang/setup-rust-toolchain@v2.0.0
         with:
           components: rustfmt
+          cache: false
+          rustflags: ""
       - run: cargo fmt --all -- --check
 
   clippy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions-rust-lang/setup-rust-toolchain@v2.0.0
         with:
           components: clippy
+          cache: false
+          rustflags: ""
       - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -32,7 +36,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions-rust-lang/setup-rust-toolchain@v2.0.0
+        with:
+          cache: false
+          rustflags: ""
       - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo build --all-features
       - run: cargo test --all-features
@@ -42,7 +49,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions-rust-lang/setup-rust-toolchain@v2.0.0
+        with:
+          cache: false
+          rustflags: ""
       - uses: Swatinem/rust-cache@v2.9.2
       - name: Install the NFS client
         run: sudo apt-get update && sudo apt-get install -y nfs-common
