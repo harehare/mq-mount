@@ -18,6 +18,7 @@ jobs:
         with:
           cache: false
           rustflags: ""
+          build-warnings: ""
       - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo build --all-features --locked
       - run: cargo test --all-features --locked
@@ -53,6 +54,7 @@ jobs:
           target: ${{ matrix.target }}
           cache: false
           rustflags: ""
+          build-warnings: ""
       # winfsp-sys builds against the headers/import libs the installer
       # lays down; only the delayload thunk ships in the binary, so the
       # WinFSP driver itself doesn't need to be present on the runner.

@@ -18,6 +18,7 @@ jobs:
           components: rustfmt
           cache: false
           rustflags: ""
+          build-warnings: ""
       - run: cargo fmt --all -- --check
 
   clippy:
@@ -29,6 +30,7 @@ jobs:
           components: clippy
           cache: false
           rustflags: ""
+          build-warnings: ""
       - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -40,6 +42,7 @@ jobs:
         with:
           cache: false
           rustflags: ""
+          build-warnings: ""
       - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo build --all-features
       - run: cargo test --all-features
@@ -53,6 +56,7 @@ jobs:
         with:
           cache: false
           rustflags: ""
+          build-warnings: ""
       - uses: Swatinem/rust-cache@v2.9.2
       - name: Install the NFS client
         run: sudo apt-get update && sudo apt-get install -y nfs-common
